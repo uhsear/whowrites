@@ -64,6 +64,7 @@ PASS  a file that both reads and truncates Hydrants is kept out of the read only
 PASS  a query for Hydrants does not report HydrantsChanges at all
 PASS  an unresolved destructive call site is always reported as a caveat
 PASS  an invalid escape sequence in the scanned file raises no warning out of this tool  <-- pinned defect
+PASS  a unique prefix of --destructive-only is refused by the parser  <-- pinned defect
 ...
 PASS  a file the reader refuses is an error, never a clean answer
 PASS  a null byte in the source is an error, not a traceback
@@ -75,7 +76,7 @@ PASS  main reports 0 when only readers touch the dataset
 PASS  the self-test leaves no directory behind
 PASS  check() and raises() really do record a failure  <-- pinned defect
 --------------------------------------------------------------------
-125 assertions, 0 failed
+126 assertions, 0 failed
 ```
 
 ## Requirements
@@ -88,10 +89,9 @@ a laptop that has no ArcGIS licence and no connection to the database you are as
 git clone https://github.com/uhsear/whowrites.git
 ```
 
-The self-test was run on Windows with Python 3.13.2, 3.13.7 and 3.12.10, and on Linux
-with Python 3.12.3.
-All four report the same 125 assertions. The source uses no f-strings and no syntax added after
-Python 3.8, but only 3.12 and 3.13 were run.
+The self-test was run on Windows with Python 3.13.2 and reports 126 assertions.
+The source uses no f-strings and no syntax added after Python 3.8. Only Python 3.13.2 was run
+for this count.
 
 ## Quick start
 

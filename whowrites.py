@@ -1433,6 +1433,19 @@ def self_test():
     check(_parse(["x"]).self_test is False,
           "--self-test is off by default")
 
+    # ---- a unique prefix of the longest option is refused, not guessed at
+    stderr_saved = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        abbreviated = _parse(["x", "--destructive"])
+    except SystemExit:
+        abbreviated = None
+    finally:
+        sys.stderr = stderr_saved
+    check(abbreviated is None,
+          "a unique prefix of --destructive-only is refused by the parser  "
+          "<-- pinned defect")
+
     # ---- the io layer, against files on disk
     import shutil
     import tempfile
@@ -1588,6 +1601,7 @@ def _parse(argv):
                     "feature class, and never name a reader as the thing "
                     "destroyed.",
         epilog="This tool reads source code. It changes nothing.",
+        allow_abbrev=False,
     )
     parser.add_argument("paths", nargs="*",
                         help="Python files or directories of them to read")
