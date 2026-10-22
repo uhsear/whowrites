@@ -24,15 +24,22 @@ source, resolves the paths those scripts build, and classifies each arcpy call
 site as READ, WRITE, EMPTY or DROP.
 
 It reads source code. It never imports arcpy, never opens a geodatabase and
-never changes a file, so there is nothing here to put behind --apply.
+never changes a file, so there is nothing here to put behind --apply. No flag
+writes anything, and the parser refuses an abbreviated flag.
 
     python whowrites.py --self-test
     python whowrites.py scripts/
     python whowrites.py scripts/ --name Hydrants
     python whowrites.py scripts/ --name Hydrants --destructive-only
+    python whowrites.py scripts/ --name Hydrants --rules
+
+--rules grades who owns a dataset. A call site is PROVEN when its path
+resolved from literals in the file with no unknown piece, and POSSIBLE when
+any piece of that claim rests on a guess. The two are never merged.
 
 Exit codes: 0 nothing destructive was reported, 1 a destructive call site was
 reported, 2 a file could not be parsed or read so the answer is incomplete,
+3 (--rules only) no destructive call site is proven but one is possible,
 64 usage error.
 """
 
@@ -95,6 +102,29 @@ NO_NAME = "(no resolvable name)"
 
 SEVERITY = {DROP: 0, EMPTY: 1, WRITE: 2, READ: 3}
 DESTRUCTIVE = (DROP, EMPTY)
+
+# The two grades of --rules mode. PROVEN is a path resolved to the last
+# segment from literals this file holds. POSSIBLE is everything the tool could
+# not rule out, and each POSSIBLE site carries the reasons it is not proven.
+PROVEN = "PROVEN"
+POSSIBLE = "POSSIBLE"
+
+# The reasons a call site is POSSIBLE. BRANCH and PARAM are recorded while the
+# file is walked, because only the walk knows how a name got its value.
+BRANCH = "branch"
+PARAM = "parameter"
+WORKSPACE = "workspace"
+NO_TARGET = "target"
+WHY = {
+    BRANCH: "a name was assigned inside a branch, so another branch may "
+            "give it another value",
+    PARAM: "the path arrived through a parameter, and a caller outside the "
+           "scanned files may pass another one",
+    WORKSPACE: "the workspace is unknown, so a dataset of this name in "
+               "another workspace could be the target",
+    NO_TARGET: "the target name could not be resolved, so it could be "
+               "this dataset",
+}
 
 # Each arcpy tool maps to the arguments that name a dataset, as
 # (parameter name, positional index, verdict). The parameter names are Esri's,
@@ -341,7 +371,8 @@ class Site(object):
     """One arcpy call site, with the dataset it acts on and the verdict."""
 
     def __init__(self, path, verdict, tool, role, filename, line, via=None,
-                 detail=None):
+                 detail=None, doubts=()):
+        self.doubts = doubts
         self.path = path
         self.verdict = verdict
         self.tool = tool
@@ -367,6 +398,27 @@ class _Ctx(object):
         self.sites = []
         self.layers = {}
         self.calls = []
+        # name -> the reasons its current value is not certain, and the same
+        # for a layer name. Both feed the POSSIBLE grade of --rules mode.
+        self.taint = {}
+        self.layer_doubt = {}
+
+
+def _doubts(node, ctx):
+    """The reasons any name read inside an expression is not certain."""
+    out = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            out |= ctx.taint.get(sub.id, set())
+    return out
+
+
+def _taint(ctx, name, reasons):
+    """Record why a name's value is uncertain, or that it is certain now."""
+    if reasons:
+        ctx.taint[name] = frozenset(reasons)
+    else:
+        ctx.taint.pop(name, None)
 
 
 def _arg_of(node, role, index):
@@ -382,7 +434,7 @@ def _arg_of(node, role, index):
     return None
 
 
-def _register_layer(ctx, key, node, env, source):
+def _register_layer(ctx, key, node, env, source, doubts):
     """Record layer name -> dataset it was made from, for this file."""
     role, index = LAYER_MAKERS[key]
     arg = _arg_of(node, role, index)
@@ -398,6 +450,7 @@ def _register_layer(ctx, key, node, env, source):
         ctx.layers[name] = UNKNOWN
         return
     ctx.layers[name] = source
+    ctx.layer_doubt[name] = doubts
 
 
 def handle_call(node, env, ctx, layers):
@@ -424,17 +477,21 @@ def handle_call(node, env, ctx, layers):
         return
     key, written = found
     first = None
+    first_doubts = set()
     for role, index, verdict in TOOLS[key]:
         arg = _arg_of(node, role, index)
         if arg is None:
             continue
         path = const_value(arg, env)
         via = None
+        doubts = _doubts(arg, ctx)
         if path and UNKNOWN not in path and path in layers:
             via = path
             path = layers[path]
+            doubts |= ctx.layer_doubt.get(via, set())
         if first is None:
             first = path
+            first_doubts = doubts
         detail = None
         if key == "delete":
             kind = _arg_of(node, "data_type", 1)
@@ -443,9 +500,10 @@ def handle_call(node, env, ctx, layers):
                 if UNKNOWN not in text:
                     detail = text
         ctx.sites.append(Site(path, verdict, written, role, ctx.file,
-                              node.lineno, via, detail))
+                              node.lineno, via, detail,
+                              tuple(sorted(doubts))))
     if key in LAYER_MAKERS and first is not None:
-        _register_layer(ctx, key, node, env, first)
+        _register_layer(ctx, key, node, env, first, first_doubts)
 
 
 def visit_calls(node, env, ctx, layers):
@@ -456,14 +514,20 @@ def visit_calls(node, env, ctx, layers):
 
 
 def _bodies(node):
-    """The statement lists a compound statement owns, in execution order."""
+    """(statement list, may be skipped) for each list a compound statement owns.
+
+    An if arm, a loop body and an except handler may not run, so a name
+    assigned there is not certain afterwards. A try, with or finally body runs
+    on the normal path.
+    """
     out = []
+    skipped = isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While))
     for field in ("body", "orelse", "finalbody"):
         block = getattr(node, field, None)
         if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
-            out.append(block)
+            out.append((block, skipped))
     for handler in getattr(node, "handlers", []) or []:
-        out.append(handler.body)
+        out.append((handler.body, True))
     return out
 
 
@@ -479,7 +543,7 @@ def _heads(node):
     return out
 
 
-def walk_body(body, env, ctx, layers):
+def walk_body(body, env, ctx, layers, skipped=False):
     """Walk statements in source order, keeping a name to path environment.
 
     Assignment is sequential: the last value assigned before a call is the
@@ -487,8 +551,10 @@ def walk_body(body, env, ctx, layers):
 
     # ponytail: straight-line resolution, no branch merge. A name assigned
     # differently in two arms of an if resolves to whichever arm the walk saw
-    # last. Upgrade path is a per-name set of candidate values and a site that
-    # reports all of them.
+    # last. --rules mode no longer trusts that value: a name assigned where
+    # skipped is true is marked BRANCH and its sites grade POSSIBLE. Upgrade
+    # path is a per-name set of candidate values and a site that reports all
+    # of them.
     """
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -497,22 +563,29 @@ def walk_body(body, env, ctx, layers):
         if isinstance(node, ast.Assign):
             visit_calls(node.value, env, ctx, layers)
             value = const_value(node.value, env)
+            reasons = _doubts(node.value, ctx) | (
+                set([BRANCH]) if skipped else set())
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     env[target.id] = value
+                    _taint(ctx, target.id, reasons)
             continue
         if isinstance(node, ast.AugAssign):
             visit_calls(node.value, env, ctx, layers)
             if isinstance(node.target, ast.Name) and isinstance(node.op, ast.Add):
                 env[node.target.id] = (env.get(node.target.id, UNKNOWN)
                                        + const_value(node.value, env))
+                _taint(ctx, node.target.id,
+                       _doubts(node.value, ctx)
+                       | ctx.taint.get(node.target.id, set())
+                       | (set([BRANCH]) if skipped else set()))
             continue
         blocks = _bodies(node)
         if blocks:
             for head in _heads(node):
                 visit_calls(head, env, ctx, layers)
-            for block in blocks:
-                walk_body(block, env, ctx, layers)
+            for block, may_skip in blocks:
+                walk_body(block, env, ctx, layers, skipped or may_skip)
             continue
         visit_calls(node, env, ctx, layers)
 
@@ -596,30 +669,45 @@ def scan_source(text, filename):
     roots = arcpy_roots(tree)
     defs, order = collect_defs(tree)
 
-    def replay(bindings, layers=None):
+    def replay(bindings, layers=None, doubts=None):
         ctx = _Ctx(filename, roots, defs)
+        ctx.layer_doubt = dict(doubts or {})
         module_env = {}
         walk_body(tree.body, module_env, ctx, layers if layers else ctx.layers)
+        module_taint = dict(ctx.taint)
         for node in order:
             env = dict(module_env)
+            ctx.taint = dict(module_taint)
+            # A parameter hides a module name of the same spelling. Without
+            # this a function that takes `path` would read the module's
+            # `path` as if the caller had passed it.
+            for arg in (node.args.posonlyargs + node.args.args
+                        + node.args.kwonlyargs):
+                env.pop(arg.arg, None)
+                ctx.taint.pop(arg.arg, None)
             # An ambiguous name maps to None, so only a function that owns its
             # name is given the arguments its callers passed.
             if defs.get(node.name) is node:
-                env.update(bindings.get(node.name, {}))
+                bound = bindings.get(node.name, {})
+                env.update(bound)
+                for param in bound:
+                    ctx.taint[param] = frozenset([PARAM])
             walk_body(node.body, env, ctx, layers if layers else ctx.layers)
         return ctx
 
     bindings = {}
     layers = {}
+    layer_doubts = {}
     for _ in range(MAX_BINDING_PASSES):
         ctx = replay(bindings)
         layers = ctx.layers
+        layer_doubts = ctx.layer_doubt
         found = derive_bindings(ctx.calls, defs)
         if found == bindings:
             break
         bindings = found
 
-    final = replay(bindings, layers)
+    final = replay(bindings, layers, layer_doubts)
     # Stable sort on the line alone, so two sites on one line keep the order
     # the tool's own parameters are declared in: inputs before target.
     final.sites.sort(key=lambda s: s.line)
@@ -697,6 +785,77 @@ def exit_code(sites, query, destructive_only, errors):
     return 1 if any(s.verdict in DESTRUCTIVE for s in selected) else 0
 
 
+# ------------------------------------------------------------ rules ownership
+
+def ownership(site, query):
+    """(grade, reasons) when a call site may own the named dataset, else None.
+
+    Owning means changing it: WRITE, EMPTY and DROP. A READ never owns, so a
+    reader is never graded at all. PROVEN needs a name that matches and a path
+    with no unknown piece and no doubt recorded while the file was walked.
+    Anything else that could still be this dataset is POSSIBLE with the
+    reasons, including a call site whose target name is unknown, because that
+    call site might be acting on the dataset asked about.
+    """
+    if site.verdict == READ:
+        return None
+    if dataset(site.path) is None:
+        return POSSIBLE, (NO_TARGET,)
+    if not matches(site.path, query):
+        return None
+    reasons = list(site.doubts)
+    if UNKNOWN in site.path:
+        reasons.insert(0, WORKSPACE)
+    return (POSSIBLE if reasons else PROVEN), tuple(reasons)
+
+
+def rules_lines(sites, query, destructive_only=False):
+    """The --rules report: proven owners, possible owners, then readers."""
+    graded = []
+    for site in sites:
+        found = ownership(site, query)
+        if found is not None:
+            graded.append((site, found[0], found[1]))
+    # A file that might write the dataset is never listed as a reader, even
+    # when --destructive-only hides its call site below.
+    owners = set(site.file for site, _, _ in graded)
+
+    lines = ["OWNERSHIP OF %s" % query, ""]
+    for grade, meaning in (
+            (PROVEN, "path resolved in full from literals in the file"),
+            (POSSIBLE, "not ruled out, and not proven")):
+        chosen = [g for g in graded if g[1] == grade
+                  and (not destructive_only or g[0].verdict in DESTRUCTIVE)]
+        chosen.sort(key=lambda g: (SEVERITY[g[0].verdict], g[0].file,
+                                   g[0].line))
+        lines.append("%s (%s): %d call site(s)" % (grade, meaning,
+                                                   len(chosen)))
+        for site, _, reasons in chosen:
+            lines.extend(site_line(site))
+            if reasons:
+                lines.append("         why possible: %s"
+                             % "; ".join(WHY[r] for r in reasons))
+        lines.append("")
+
+    readers = sorted(set(s.file for s in sites
+                         if s.verdict == READ and matches(s.path, query)
+                         and s.file not in owners))
+    if readers:
+        lines.append("READ ONLY: %s" % ", ".join(readers))
+    return lines
+
+
+def rules_exit(sites, query, errors):
+    """2 partial, 1 a destroyer is proven, 3 one is only possible, else 0."""
+    if errors:
+        return 2
+    grades = [ownership(s, query) for s in sites if s.verdict in DESTRUCTIVE]
+    grades = [g[0] for g in grades if g is not None]
+    if PROVEN in grades:
+        return 1
+    return 3 if grades else 0
+
+
 # -------------------------------------------------------------- the io layer
 
 def walk_files(paths):
@@ -757,6 +916,16 @@ def scan_paths(paths):
 
 
 # ------------------------------------------------------------- the self-test
+
+def _footer(passed, failed):
+    """(lines, exit code) that close the self-test transcript."""
+    total = passed + len(failed)
+    if failed:
+        lines = ["%d assertions, %d failed" % (total, len(failed))]
+        lines.extend("  FAILED: %s" % label for label in failed)
+        return lines, 1
+    return ["%d assertions, 0 failed" % total], 0
+
 
 def self_test():
     """Assertions over the resolver, the classifier, the report and the cli.
@@ -1416,6 +1585,299 @@ def self_test():
     raises(lambda: scan("def oops(:\n    pass\n"),
            "a file that does not parse raises SyntaxError to the caller")
 
+    # ---- --rules mode: proven and possible ownership, graded apart
+    def graded(source, query="Hydrants"):
+        out = []
+        for site in scan(source):
+            found = ownership(site, query)
+            if found is not None:
+                out.append((site.verdict, found[0], found[1]))
+        return out
+
+    check(Site("p", READ, "t", "r", "f", 1).doubts == (),
+          "a call site built without doubts has none")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/Hydrants"
+    arcpy.management.TruncateTable(P)
+    arcpy.management.Append("D:/gis/s.gdb/Stage", P, "NO_TEST")
+    arcpy.management.GetCount(P)
+    """) == [(EMPTY, PROVEN, ()), (WRITE, PROVEN, ())],
+          "a path resolved from literals is PROVEN, and a read is not graded")
+    check(graded("""
+    import arcpy
+    arcpy.management.TruncateTable("D:/gis/w.gdb/Mains")
+    arcpy.management.TruncateTable("D:/gis/w.gdb/HydrantsChanges")
+    arcpy.da.SearchCursor("D:/gis/w.gdb/Hydrants", ["OID@"])
+    """) == [],
+          "another dataset, a longer name and a reader are not graded at all")
+    check(graded("""
+    import arcpy
+    import os
+    arcpy.management.TruncateTable(os.path.join(arcpy.env.workspace,
+                                                "Hydrants"))
+    """) == [(EMPTY, POSSIBLE, (WORKSPACE,))],
+          "a known name in an unknown workspace is POSSIBLE, not PROVEN"
+          "  <-- pinned defect")
+    unnamed = """
+    import arcpy
+    def wipe(path):
+        arcpy.management.TruncateTable(path)
+        arcpy.management.AddField(path, "x", "TEXT")
+    """
+    check(graded(unnamed) == [(EMPTY, POSSIBLE, (NO_TARGET,)),
+                              (WRITE, POSSIBLE, (NO_TARGET,))],
+          "a call site with no resolvable name might be this dataset"
+          "  <-- pinned defect")
+    check(graded(unnamed, "Anything") == graded(unnamed),
+          "an unresolved call site is possible whatever name is asked about")
+
+    # A name set in an arm of an if may not be the name the call sees.
+    arms = """
+    import arcpy
+    if FLAG:
+        P = "D:/gis/w.gdb/Hydrants"
+    else:
+        P = "D:/gis/w.gdb/Hydrants"
+    arcpy.management.TruncateTable(P)
+    """
+    check(graded(arms) == [(EMPTY, POSSIBLE, (BRANCH,))],
+          "a name assigned in both arms of an if is POSSIBLE, never PROVEN"
+          "  <-- pinned defect")
+    check(graded("""
+    import arcpy
+    if FLAG:
+        P = "D:/gis/w.gdb/Hydrants"
+    P = "D:/gis/w.gdb/Hydrants"
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, PROVEN, ())],
+          "an assignment that always runs afterwards clears the branch doubt")
+    check(graded("""
+    import arcpy
+    try:
+        P = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.TruncateTable(P)
+    finally:
+        Q = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.DeleteRows(Q)
+    with open("x") as handle:
+        R = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.DeleteFeatures(R)
+    """) == [(EMPTY, PROVEN, ())] * 3,
+          "try, finally and with bodies run on the normal path and stay PROVEN")
+    check(graded("""
+    import arcpy
+    try:
+        pass
+    except Exception:
+        P = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (BRANCH,))],
+          "a name assigned in an except handler is POSSIBLE")
+    check(graded("""
+    import arcpy
+    for item in ITEMS:
+        P = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.TruncateTable(P)
+    while FLAG:
+        Q = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.DeleteRows(Q)
+    """) == [(EMPTY, POSSIBLE, (BRANCH,))] * 2,
+          "a name assigned in a loop body is POSSIBLE")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb"
+    if FLAG:
+        P += "/Hydrants"
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (BRANCH,))],
+          "an augmented assignment inside a branch is POSSIBLE")
+    check(graded("""
+    import arcpy
+    if FLAG:
+        P = "D:/gis/w.gdb"
+    P += "/Hydrants"
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (BRANCH,))],
+          "extending a doubtful name keeps the doubt")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb"
+    P += "/Hydrants"
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, PROVEN, ())],
+          "extending a certain name keeps it PROVEN")
+    check(graded("""
+    import arcpy
+    if FLAG:
+        BASE = "D:/gis/w.gdb"
+    else:
+        BASE = "D:/gis/x.gdb"
+    P = BASE + "/Hydrants"
+    Q = f"{BASE}/Hydrants"
+    arcpy.management.TruncateTable(P)
+    arcpy.management.DeleteRows(Q)
+    """) == [(EMPTY, POSSIBLE, (BRANCH,))] * 2,
+          "a doubt travels through concatenation and an f-string")
+    check(graded("""
+    import arcpy
+    import os
+    if FLAG:
+        BASE = "D:/gis/w.gdb"
+    else:
+        BASE = "D:/gis/x.gdb"
+    arcpy.management.TruncateTable(os.path.join(BASE, "Hydrants"))
+    """) == [(EMPTY, POSSIBLE, (BRANCH,))],
+          "a doubt travels through os.path.join")
+    check(graded("""
+    import arcpy
+    def first():
+        if FLAG:
+            p = "D:/gis/w.gdb/Hydrants"
+        else:
+            p = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.TruncateTable(p)
+
+    def second():
+        p = "D:/gis/w.gdb/Hydrants"
+        arcpy.management.TruncateTable(p)
+    """) == [(EMPTY, POSSIBLE, (BRANCH,)), (EMPTY, PROVEN, ())],
+          "a doubt in one function does not leak into the next")
+    check(graded("""
+    import arcpy
+    if FLAG:
+        P = "D:/gis/w.gdb/Hydrants"
+    else:
+        P = "D:/gis/w.gdb/Hydrants"
+
+    def wipe():
+        arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (BRANCH,))],
+          "a doubtful module constant is doubtful inside a function")
+
+    # A parameter is proven by its callers in these files and by no others.
+    via_param = """
+    import arcpy
+    TARGET = "D:/gis/w.gdb/Hydrants"
+
+    def replace(target):
+        arcpy.management.TruncateTable(target)
+
+    def run():
+        replace(TARGET)
+    """
+    check(graded(via_param) == [(EMPTY, POSSIBLE, (PARAM,))],
+          "a path bound through a parameter is POSSIBLE, because a caller "
+          "outside the scanned files may pass another  <-- pinned defect")
+    check(graded(via_param.replace("replace(TARGET)", "replace(target=TARGET)"))
+          == [(EMPTY, POSSIBLE, (PARAM,))],
+          "a keyword binding is POSSIBLE too")
+    check(graded("""
+    import arcpy
+    TARGET = "D:/gis/w.gdb"
+
+    def replace(target):
+        if FLAG:
+            sub = "Hydrants"
+        arcpy.management.TruncateTable(target + "/" + sub)
+
+    replace(TARGET)
+    """) == [(EMPTY, POSSIBLE, (BRANCH, PARAM))],
+          "two doubts on one call site are both reported, in a fixed order")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/Hydrants"
+
+    def wipe(P):
+        arcpy.management.TruncateTable(P)
+
+    def wipe_kw(*, P):
+        arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))] * 2,
+          "a parameter hides a module constant of the same name  "
+          "<-- pinned defect")
+
+    # A layer name stands in for the dataset, and carries its doubt with it.
+    check(graded("""
+    import arcpy
+    SRC = "D:/gis/w.gdb/Hydrants"
+    arcpy.management.MakeFeatureLayer(SRC, "lyr")
+    arcpy.management.DeleteFeatures("lyr")
+    """) == [(EMPTY, PROVEN, ())],
+          "a layer made from a certain path is PROVEN")
+    layer_doubt = scan("""
+    import arcpy
+    if FLAG:
+        SRC = "D:/gis/w.gdb/Hydrants"
+    else:
+        SRC = "D:/gis/w.gdb/Hydrants"
+    arcpy.management.MakeFeatureLayer(SRC, "lyr")
+    arcpy.management.DeleteFeatures("lyr")
+    """)
+    check(layer_doubt[-1].via == "lyr" and layer_doubt[-1].doubts == (BRANCH,),
+          "a layer made from a doubtful path passes the doubt to its delete")
+
+    # The report.
+    ws_src = """
+    import arcpy
+    import os
+    arcpy.management.TruncateTable(os.path.join(arcpy.env.workspace,
+                                                "Hydrants"))
+    """
+    unknown_src = unnamed + """
+    arcpy.da.SearchCursor("D:/gis/w.gdb/Hydrants", ["OID@"])
+    """
+    sites = (scan(loader, "loader.py") + scan(compare, "compare.py")
+             + scan(ws_src, "ws.py") + scan(unknown_src, "unknown.py"))
+    text = "\n".join(rules_lines(sites, "Hydrants"))
+    proven_head = "PROVEN (path resolved in full from literals in the file)"
+    possible_head = "POSSIBLE (not ruled out, and not proven)"
+    check(text.startswith("OWNERSHIP OF Hydrants\n"),
+          "the rules report opens with the dataset it grades")
+    check(proven_head + ": 2 call site(s)" in text,
+          "the proven list holds the truncate and the append of the loader")
+    check(possible_head + ": 3 call site(s)" in text,
+          "the possible list holds the workspace guess and the unresolved pair")
+    proven_part = text.split(possible_head)[0]
+    check(proven_part.index("EMPTY") < proven_part.index("WRITE"),
+          "a proven truncate is listed above a proven append")
+    check("loader.py" in proven_part and "ws.py" not in proven_part,
+          "the unknown workspace is not listed as proven")
+    check("why possible: the workspace is unknown" in text,
+          "a possible call site says why it is not proven")
+    check("why possible: the target name could not be resolved" in text,
+          "an unresolved call site says why it is possible")
+    check("READ ONLY: compare.py" in text and "READ ONLY: compare.py," not in text,
+          "only the file that might not write the dataset is read only"
+          "  <-- pinned defect")
+    narrowed = "\n".join(rules_lines(sites, "Hydrants", True))
+    check(proven_head + ": 1 call site(s)" in narrowed
+          and "WRITE" not in narrowed.split(possible_head)[0],
+          "--destructive-only drops the proven append from the list")
+    check("READ ONLY: compare.py" in narrowed,
+          "--destructive-only does not turn a hidden writer into a reader")
+    none_proven = "\n".join(rules_lines(sites, "Laterals"))
+    check(proven_head + ": 0 call site(s)" in none_proven
+          and possible_head + ": 2 call site(s)" in none_proven,
+          "a dataset nobody proves still lists the call sites that might")
+    check("DESTROYED BY" not in text,
+          "the rules report is a different report from the default one")
+    check(rules_exit(sites, "Hydrants", []) == 1,
+          "a proven destroyer exits 1 in rules mode")
+    check(rules_exit(sites, "Laterals", []) == 3,
+          "a destroyer that is only possible exits 3, apart from 1"
+          "  <-- pinned defect")
+    check(rules_exit(scan(loader), "Laterals", []) == 0,
+          "no destroyer proven or possible exits 0")
+    check(rules_exit(scan("""
+    import arcpy
+    def go(path):
+        arcpy.management.AddField(path, "x", "TEXT")
+    """), "Hydrants", []) == 0,
+          "a possible writer that destroys nothing does not change the exit")
+    check(rules_exit(sites, "Hydrants", [("x.py", "boom")]) == 2,
+          "an unreadable file is still exit 2 in rules mode")
+
     # ---- argument parsing
     args = _parse(["scripts", "--name", "Hydrants"])
     check(args.paths == ["scripts"] and args.name == "Hydrants",
@@ -1428,6 +1890,9 @@ def self_test():
           "reads are reported unless --destructive-only is given")
     check(_parse(["x", "--destructive-only"]).destructive_only is True,
           "--destructive-only is off until asked for")
+    check(_parse(["x", "--name", "H", "--rules"]).rules is True
+          and _parse(["x"]).rules is False,
+          "--rules is a flag, and it is off by default")
     check(_parse(["--self-test"]).self_test is True,
           "--self-test is a flag")
     check(_parse(["x"]).self_test is False,
@@ -1445,6 +1910,20 @@ def self_test():
     check(abbreviated is None,
           "a unique prefix of --destructive-only is refused by the parser  "
           "<-- pinned defect")
+    refused = []
+    for flag in ("--rule", "--rul", "--apply", "--ap"):
+        sys.stderr = io.StringIO()
+        accepted = True
+        try:
+            _parse(["x", flag])
+        except SystemExit:
+            accepted = False
+        finally:
+            sys.stderr = stderr_saved
+        refused.append(not accepted)
+    check(refused == [True] * 4,
+          "a prefix of --rules is refused, and no write flag exists to "
+          "abbreviate  <-- pinned defect")
 
     # ---- the io layer, against files on disk
     import shutil
@@ -1505,6 +1984,22 @@ def self_test():
         globals()["MAX_SOURCE_BYTES"] = old_limit
         check(read_source(os.path.join(tmp, "missing.py")) is None,
               "a file that is not there reads as None, not a traceback")
+        class Failing(object):
+            def read(self):
+                raise IOError("simulated read failure")
+
+            def close(self):
+                pass
+
+        real_open = io.open
+        io.open = lambda *args, **kwargs: Failing()
+        try:
+            unreadable = read_source(big)
+        finally:
+            io.open = real_open
+        check(unreadable is None,
+              "a file that opens and then fails to read is None, not a "
+              "traceback")
         globals()["MAX_SOURCE_BYTES"] = 1
         oversize = scan_paths([big])
         globals()["MAX_SOURCE_BYTES"] = old_limit
@@ -1559,9 +2054,61 @@ def self_test():
         check(codes[3] == 64, "main with no path is a usage error")
         check(codes[4] == 64,
               "main with a path that does not exist is a usage error")
+
+        write("ws.py", ws_src)
+        quiet, loud = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        try:
+            codes = [main([os.path.join(tmp, "loader.py"), "--name",
+                           "Hydrants", "--rules"]),
+                     main([os.path.join(tmp, "compare.py"), "--name",
+                           "Hydrants", "--rules"]),
+                     main([os.path.join(tmp, "ws.py"), "--name",
+                           "Hydrants", "--rules"]),
+                     main([tmp, "--name", "Hydrants", "--rules"]),
+                     main([tmp, "--rules"])]
+            printed = sys.stdout.getvalue()
+        finally:
+            sys.stdout, sys.stderr = quiet, loud
+        check(codes[0] == 1 and "PROVEN (" in printed,
+              "main --rules reports 1 and prints the graded report")
+        check(codes[1] == 0,
+              "main --rules reports 0 when the file only reads the dataset")
+        check(codes[2] == 3,
+              "main --rules reports 3 when the only owner is possible")
+        check(codes[3] == 2,
+              "main --rules reports 2 when one file in the directory is broken")
+        check(codes[4] == 64,
+              "main --rules without --name is a usage error")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     check(not os.path.isdir(tmp), "the self-test leaves no directory behind")
+
+    # ---- the module run as a script, and imported under another name
+    import runpy
+
+    argv_saved, stderr_saved = sys.argv, sys.stderr
+    sys.argv, sys.stderr = ["whowrites.py"], io.StringIO()
+    guard_code = None
+    try:
+        try:
+            runpy.run_path(__file__, run_name="__main__")
+        except SystemExit as exc:
+            guard_code = exc.code
+        imported = runpy.run_path(__file__, run_name="whowrites_probe")
+    finally:
+        sys.argv, sys.stderr = argv_saved, stderr_saved
+    check(guard_code == 64,
+          "run as a script, the module exits with the code main returns")
+    check("main" in imported,
+          "imported under another name, the module runs nothing")
+
+    # ---- the footer, including the branch that only a failure reaches
+    check(_footer(3, []) == (["3 assertions, 0 failed"], 0),
+          "a clean run ends on the assertion count and exits 0")
+    check(_footer(3, ["a", "b"]) == (["5 assertions, 2 failed",
+                                      "  FAILED: a", "  FAILED: b"], 1),
+          "a failing run counts the failures, names them and exits 1")
 
     # ---- the harness itself. A check() that cannot record a failure would
     # report every assertion above as a pass, which is the one defect none of
@@ -1582,14 +2129,10 @@ def self_test():
           "check() and raises() really do record a failure  <-- pinned defect")
 
     print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for label in failed:
-            print("  FAILED: %s" % label)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    lines, code = _footer(passed[0], failed)
+    for line in lines:
+        print(line)
+    return code
 
 
 # ----------------------------------------------------------------------- cli
@@ -1612,6 +2155,10 @@ def _parse(argv):
                         action="store_true",
                         help="report only the call sites that empty or drop "
                              "a dataset")
+    parser.add_argument("--rules", action="store_true",
+                        help="grade each call site that may own --name as "
+                             "PROVEN or POSSIBLE, and report the two apart. "
+                             "Needs --name. Exit 3 means possible only.")
     parser.add_argument("--self-test", dest="self_test", action="store_true",
                         help="run the assertions and exit")
     return parser.parse_args(argv)
@@ -1627,6 +2174,10 @@ def main(argv=None):
         print("error: pass one or more Python files or directories. Use "
               "--self-test to check the tool without any.", file=sys.stderr)
         return 64
+    if args.rules and args.name is None:
+        print("error: --rules grades ownership of one dataset. Pass --name.",
+              file=sys.stderr)
+        return 64
     missing = [p for p in args.paths if not os.path.exists(p)]
     if missing:
         # A typo would otherwise report a clean answer over nothing at all,
@@ -1639,10 +2190,16 @@ def main(argv=None):
     sites, errors = scan_paths(args.paths)
     print("whowrites: %d file(s), %d call site(s)" % (len(files), len(sites)))
     print("")
-    for line in report_lines(sites, args.name, args.destructive_only):
+    if args.rules:
+        lines = rules_lines(sites, args.name, args.destructive_only)
+    else:
+        lines = report_lines(sites, args.name, args.destructive_only)
+    for line in lines:
         print(line)
     for path, message in errors:
         print("error: %s: %s" % (path, message), file=sys.stderr)
+    if args.rules:
+        return rules_exit(sites, args.name, errors)
     return exit_code(sites, args.name, args.destructive_only, errors)
 
 
