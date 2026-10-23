@@ -25,7 +25,9 @@ site as READ, WRITE, EMPTY or DROP.
 
 It reads source code. It never imports arcpy, never opens a geodatabase and
 never changes a file, so there is nothing here to put behind --apply. No flag
-writes anything, and the parser refuses an abbreviated flag.
+writes anything except --self-test, which writes fixture files into a
+temporary directory and removes it again. The parser refuses an abbreviated
+flag.
 
     python whowrites.py --self-test
     python whowrites.py scripts/
@@ -38,9 +40,9 @@ resolved from literals in the file with no unknown piece, and POSSIBLE when
 any piece of that claim rests on a guess. The two are never merged.
 
 Exit codes: 0 nothing destructive was reported, 1 a destructive call site was
-reported, 2 a file could not be parsed or read so the answer is incomplete,
-3 (--rules only) no destructive call site is proven but one is possible,
-64 usage error.
+reported, 2 a file or directory could not be read, listed or parsed, or held
+no source, so the answer is incomplete, 3 (--rules only) no destructive call
+site is proven but one is possible, 64 usage error.
 """
 
 from __future__ import print_function
@@ -113,6 +115,7 @@ POSSIBLE = "POSSIBLE"
 # file is walked, because only the walk knows how a name got its value.
 BRANCH = "branch"
 PARAM = "parameter"
+REBOUND = "rebound"
 WORKSPACE = "workspace"
 NO_TARGET = "target"
 WHY = {
@@ -120,6 +123,8 @@ WHY = {
             "give it another value",
     PARAM: "the path arrived through a parameter, and a caller outside the "
            "scanned files may pass another one",
+    REBOUND: "a module name is assigned more than once or through global, "
+             "and a function sees the value it has when the call runs",
     WORKSPACE: "the workspace is unknown, so a dataset of this name in "
                "another workspace could be the target",
     NO_TARGET: "the target name could not be resolved, so it could be "
@@ -151,6 +156,22 @@ TOOLS = {
     "deletefield": (("in_table", 0, WRITE),),
     "selectlayerbyattribute": (("in_layer_or_view", 0, READ),),
     "featureclasstofeatureclass": (("in_features", 0, READ),),
+    "tabletotable": (("in_rows", 0, READ),),
+    "exportfeatures": (("in_features", 0, READ), ("out_features", 1, WRITE)),
+    "buffer": (("in_features", 0, READ), ("out_feature_class", 1, WRITE)),
+    "clip": (("in_features", 0, READ), ("clip_features", 1, READ),
+             ("out_feature_class", 2, WRITE)),
+    "intersect": (("in_features", 0, READ), ("out_feature_class", 1, WRITE)),
+    "merge": (("inputs", 0, READ), ("output", 1, WRITE)),
+    "project": (("in_dataset", 0, READ), ("out_dataset", 1, WRITE)),
+}
+
+# Two tools build their output from a folder-like argument and a name, as
+# (parameter, index, parameter, index). The dataset they write is the two
+# joined, so one role cannot hold it.
+OUTPUT_PAIRS = {
+    "featureclasstofeatureclass": ("out_path", 1, "out_name", 2),
+    "tabletotable": ("out_path", 1, "out_name", 2),
 }
 
 # Tools that mint a layer or view name standing in for a dataset. The value is
@@ -170,6 +191,12 @@ TOOL_SUFFIXES = ("_management", "_analysis", "_conversion", "_cartography",
 # File extensions stripped before a dataset name is compared, so that
 # roads.shp answers to the name roads.
 DATA_SUFFIXES = (".shp", ".dbf", ".gdb", ".sde", ".lyrx", ".lyr", ".csv")
+
+# A path segment ending in one of these names a workspace. A relative path
+# with none of them depends on arcpy.env.workspace, which this tool cannot
+# see, so a bare dataset name is never proven.
+WORKSPACE_SUFFIXES = (".gdb", ".sde", ".mdb", ".gpkg")
+WORKSPACE_NAMES = ("in_memory", "memory")
 
 # One path separator, either spelling, one or more times. Windows accepts both
 # and so do the scripts this reads.
@@ -256,6 +283,23 @@ def names(text):
     return tuple(out)
 
 
+def anchored(text):
+    """True when a path names its own workspace instead of borrowing one.
+
+    A drive letter or a leading separator does. So does a .gdb, .sde, .mdb or
+    .gpkg segment before the last one. A bare name such as Hydrants does not:
+    arcpy resolves it against the current workspace environment, which a
+    source file may set anywhere or nowhere.
+    """
+    if ABS_RE.match(text):
+        return True
+    for part in split_path(text)[:-1]:
+        low = part.lower()
+        if low.endswith(WORKSPACE_SUFFIXES) or low in WORKSPACE_NAMES:
+            return True
+    return False
+
+
 def matches(text, query):
     """True when a resolved path names the dataset the operator asked about."""
     wanted = query.lower()
@@ -322,12 +366,36 @@ def const_value(node, env):
     return UNKNOWN
 
 
-def tool_key(func, roots):
-    """The table key for an arcpy call, or None when the call is not one.
+class Imports(object):
+    """The names in one file that stand for arcpy or for one of its tools."""
 
-    The chain has to start at a name that came from an arcpy import. Without
-    that check a local helper called delete() is reported as a dropped dataset.
+    def __init__(self):
+        # Names that stand for arcpy or one of its toolbox modules.
+        self.roots = set()
+        # Name used in this file -> the arcpy name it stands for. Covers
+        # `from arcpy.management import TruncateTable as trunc` and a tool
+        # saved in a variable, `fn = arcpy.TruncateTable_management`.
+        self.aliases = {}
+        # True after `from arcpy import *`, which makes a bare tool name a call.
+        self.star = False
+
+
+# The toolbox module names, from the same list as the _management suffixes.
+TOOLBOXES = tuple(suffix[1:] for suffix in TOOL_SUFFIXES)
+
+
+def _chain(func):
+    """The dotted parts of a call target, or None when it is not a plain chain.
+
+    getattr(arcpy, "TruncateTable_management") with a literal name is the
+    same call as the attribute form, so it is read as one.
     """
+    if (isinstance(func, ast.Call) and isinstance(func.func, ast.Name)
+            and func.func.id == "getattr" and len(func.args) == 2
+            and isinstance(func.args[1], ast.Constant)
+            and isinstance(func.args[1].value, str)):
+        func = ast.Attribute(value=func.args[0], attr=func.args[1].value,
+                             ctx=ast.Load())
     parts = []
     node = func
     while isinstance(node, ast.Attribute):
@@ -337,9 +405,26 @@ def tool_key(func, roots):
         return None
     parts.append(node.id)
     parts.reverse()
-    if parts[0] not in roots:
+    return parts
+
+
+def tool_key(func, imports):
+    """The table key for an arcpy call, or None when the call is not one.
+
+    The chain has to start at a name that came from an arcpy import. Without
+    that check a local helper called delete() is reported as a dropped dataset.
+    """
+    parts = _chain(func)
+    if parts is None:
+        return None
+    bare = len(parts) == 1
+    if not (parts[0] in imports.roots
+            or (imports.star and (parts[0] in TOOLBOXES
+                                  or (bare and parts[0][:1].isupper())))):
         return None
     name = parts[-1]
+    if bare:
+        name = imports.aliases.get(name, name)
     key = name
     for suffix in TOOL_SUFFIXES:
         if key.lower().endswith(suffix):
@@ -351,20 +436,33 @@ def tool_key(func, roots):
     return key, name
 
 
-def arcpy_roots(tree):
-    """Names that stand for arcpy in this file, including aliases."""
-    roots = set()
+def arcpy_imports(tree):
+    """Everything in this file that stands for arcpy, including aliases."""
+    imports = Imports()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "arcpy" or alias.name.startswith("arcpy."):
-                    roots.add(alias.asname or alias.name.split(".")[0])
+                    imports.roots.add(alias.asname or alias.name.split(".")[0])
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             if module == "arcpy" or module.startswith("arcpy."):
                 for alias in node.names:
-                    roots.add(alias.asname or alias.name)
-    return roots
+                    if alias.name == "*":
+                        imports.star = True
+                        continue
+                    imports.roots.add(alias.asname or alias.name)
+                    if alias.asname:
+                        imports.aliases[alias.asname] = alias.name
+    # A tool saved in a variable: fn = arcpy.TruncateTable_management.
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            found = tool_key(node.value, imports)
+            if found is not None:
+                imports.roots.add(node.targets[0].id)
+                imports.aliases[node.targets[0].id] = found[1]
+    return imports
 
 
 class Site(object):
@@ -391,9 +489,9 @@ class Site(object):
 class _Ctx(object):
     """What one pass over a file collects."""
 
-    def __init__(self, filename, roots, defs):
+    def __init__(self, filename, imports, defs):
         self.file = filename
-        self.roots = roots
+        self.imports = imports
         self.defs = defs
         self.sites = []
         self.layers = {}
@@ -462,17 +560,20 @@ def handle_call(node, env, ctx, layers):
         name = node.func.attr
     if name in ctx.defs:
         # A call to a function defined in this file. Its resolved arguments
-        # are what lets a path reach a parameter.
+        # are what lets a path reach a parameter. A *args or **kwargs call
+        # fills parameters this tool cannot count, so it is marked opaque.
         positional = []
+        opaque = any(kw.arg is None for kw in node.keywords)
         for arg in node.args:
             if isinstance(arg, ast.Starred):
+                opaque = True
                 break
             positional.append(const_value(arg, env))
         keywords = dict((kw.arg, const_value(kw.value, env))
                         for kw in node.keywords if kw.arg)
-        ctx.calls.append((name, positional, keywords))
+        ctx.calls.append((name, positional, keywords, opaque))
 
-    found = tool_key(node.func, ctx.roots)
+    found = tool_key(node.func, ctx.imports)
     if found is None:
         return
     key, written = found
@@ -481,6 +582,12 @@ def handle_call(node, env, ctx, layers):
     for role, index, verdict in TOOLS[key]:
         arg = _arg_of(node, role, index)
         if arg is None:
+            # A destructive or writing argument that cannot be read, such as
+            # TruncateTable(*args), is still a call site. Dropping it would
+            # report a clean answer over a call this tool saw.
+            if verdict != READ:
+                ctx.sites.append(Site(UNKNOWN, verdict, written, role,
+                                      ctx.file, node.lineno))
             continue
         path = const_value(arg, env)
         via = None
@@ -502,15 +609,61 @@ def handle_call(node, env, ctx, layers):
         ctx.sites.append(Site(path, verdict, written, role, ctx.file,
                               node.lineno, via, detail,
                               tuple(sorted(doubts))))
+    pair = OUTPUT_PAIRS.get(key)
+    if pair is not None:
+        folder = _arg_of(node, pair[0], pair[1])
+        leaf = _arg_of(node, pair[2], pair[3])
+        if folder is None or leaf is None:
+            path, doubts = UNKNOWN, set()
+        else:
+            path = join_paths([const_value(folder, env),
+                               const_value(leaf, env)])
+            doubts = _doubts(folder, ctx) | _doubts(leaf, ctx)
+        ctx.sites.append(Site(path, WRITE, written, pair[2], ctx.file,
+                              node.lineno, None, None,
+                              tuple(sorted(doubts))))
     if key in LAYER_MAKERS and first is not None:
         _register_layer(ctx, key, node, env, first, first_doubts)
 
 
 def visit_calls(node, env, ctx, layers):
     """Every call inside one expression or simple statement, in source order."""
+    # A walrus binds a name this tool does not evaluate, so the old value of
+    # that name must not survive into the calls that follow it.
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.NamedExpr):
+            _unknown(ctx, env, [sub.target.id])
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
             handle_call(sub, env, ctx, layers)
+
+
+def _unknown(ctx, env, names):
+    """Forget what these names held. A stale constant is a wrong accusation."""
+    for name in names:
+        env[name] = UNKNOWN
+        ctx.taint.pop(name, None)
+
+
+def _stores(node):
+    """Every name an assignment target binds, however it is unpacked."""
+    return [sub.id for sub in ast.walk(node)
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store)]
+
+
+def _binds(node):
+    """Names a compound statement binds that are not plain assignments."""
+    out = []
+    target = getattr(node, "target", None)
+    if target is not None:
+        out.extend(_stores(target))
+    for item in getattr(node, "items", ()):
+        if item.optional_vars is not None:
+            out.extend(_stores(item.optional_vars))
+    for handler in getattr(node, "handlers", ()):
+        if handler.name:
+            out.append(handler.name)
+    return out
 
 
 def _bodies(node):
@@ -547,47 +700,85 @@ def walk_body(body, env, ctx, layers, skipped=False):
     """Walk statements in source order, keeping a name to path environment.
 
     Assignment is sequential: the last value assigned before a call is the
-    value that call sees.
+    value that call sees. Every other way to bind a name, a loop target, a
+    tuple unpack, a with target, a walrus, a subtraction, makes the name
+    unknown, because a stale constant would name the wrong dataset.
 
     # ponytail: straight-line resolution, no branch merge. A name assigned
     # differently in two arms of an if resolves to whichever arm the walk saw
-    # last. --rules mode no longer trusts that value: a name assigned where
-    # skipped is true is marked BRANCH and its sites grade POSSIBLE. Upgrade
-    # path is a per-name set of candidate values and a site that reports all
-    # of them.
+    # last. A name assigned where skipped is true is marked BRANCH, and
+    # --rules grades a site that rests on it POSSIBLE whatever dataset the
+    # last value names. Upgrade path is a per-name set of candidate values
+    # and a site that reports all of them.
     """
     for node in body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                             ast.ClassDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if isinstance(node, ast.Assign):
+        if isinstance(node, ast.ClassDef):
+            # A class body runs when the class is defined. Its names stay in
+            # the class, so the environment and the doubts are copies.
+            saved = dict(ctx.taint)
+            walk_body(node.body, dict(env), ctx, layers, skipped)
+            ctx.taint = saved
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if node.value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) \
+                else [node.target]
             visit_calls(node.value, env, ctx, layers)
             value = const_value(node.value, env)
             reasons = _doubts(node.value, ctx) | (
                 set([BRANCH]) if skipped else set())
-            for target in node.targets:
+            for target in targets:
                 if isinstance(target, ast.Name):
                     env[target.id] = value
                     _taint(ctx, target.id, reasons)
+                else:
+                    _unknown(ctx, env, _stores(target))
             continue
         if isinstance(node, ast.AugAssign):
             visit_calls(node.value, env, ctx, layers)
-            if isinstance(node.target, ast.Name) and isinstance(node.op, ast.Add):
-                env[node.target.id] = (env.get(node.target.id, UNKNOWN)
-                                       + const_value(node.value, env))
-                _taint(ctx, node.target.id,
-                       _doubts(node.value, ctx)
-                       | ctx.taint.get(node.target.id, set())
-                       | (set([BRANCH]) if skipped else set()))
+            if isinstance(node.target, ast.Name):
+                if isinstance(node.op, ast.Add):
+                    env[node.target.id] = (env.get(node.target.id, UNKNOWN)
+                                           + const_value(node.value, env))
+                    _taint(ctx, node.target.id,
+                           _doubts(node.value, ctx)
+                           | ctx.taint.get(node.target.id, set())
+                           | (set([BRANCH]) if skipped else set()))
+                else:
+                    _unknown(ctx, env, [node.target.id])
             continue
         blocks = _bodies(node)
         if blocks:
             for head in _heads(node):
                 visit_calls(head, env, ctx, layers)
+            _unknown(ctx, env, _binds(node))
             for block, may_skip in blocks:
                 walk_body(block, env, ctx, layers, skipped or may_skip)
             continue
         visit_calls(node, env, ctx, layers)
+
+
+def rebound_names(tree):
+    """Module names assigned more than once, or assigned through `global`."""
+    counts = {}
+    out = set()
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Global):
+                    out.update(sub.names)
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            counts[node.id] = counts.get(node.id, 0) + 1
+        stack.extend(ast.iter_child_nodes(node))
+    out.update(name for name, count in counts.items() if count > 1)
+    return out
 
 
 def collect_defs(tree):
@@ -628,13 +819,15 @@ def derive_bindings(calls, defs):
         if node is None:
             continue
         recorded = [c for c in calls if c[0] == name]
-        if not recorded:
+        # A call through *args or **kwargs may pass anything to any
+        # parameter, so no single binding is safe for that function.
+        if not recorded or any(c[3] for c in recorded):
             continue
-        params = [a.arg for a in node.args.args]
+        params = [a.arg for a in node.args.posonlyargs + node.args.args]
         if params and params[0] in ("self", "cls"):
             params = params[1:]
         seen = {}
-        for _, positional, keywords in recorded:
+        for _, positional, keywords, _ in recorded:
             for index, value in enumerate(positional):
                 if index < len(params):
                     seen.setdefault(params[index], set()).add(value)
@@ -666,15 +859,22 @@ def scan_source(text, filename):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         tree = ast.parse(text, filename)
-    roots = arcpy_roots(tree)
+    imports = arcpy_imports(tree)
     defs, order = collect_defs(tree)
+    rebound = rebound_names(tree)
 
     def replay(bindings, layers=None, doubts=None):
-        ctx = _Ctx(filename, roots, defs)
+        ctx = _Ctx(filename, imports, defs)
         ctx.layer_doubt = dict(doubts or {})
         module_env = {}
         walk_body(tree.body, module_env, ctx, layers if layers else ctx.layers)
         module_taint = dict(ctx.taint)
+        # A function runs after the module body, so it reads the value a
+        # name has at the end. A name bound twice, or through global, may
+        # hold a different value when the call actually runs.
+        for name in rebound:
+            module_taint[name] = frozenset(
+                module_taint.get(name, frozenset()) | frozenset([REBOUND]))
         for node in order:
             env = dict(module_env)
             ctx.taint = dict(module_taint)
@@ -727,6 +927,25 @@ def site_line(site):
     return [head, "         %s" % render(site.path)]
 
 
+def unsure(sites, query):
+    """(unresolved, doubted) destructive call sites the main list can miss.
+
+    Unresolved sites have no dataset name. Doubted sites name another dataset
+    on the strength of a branch, a parameter or a rebound name, so the value
+    that reaches the call may be the one asked about. With no query every
+    site is already listed, so nothing is doubted.
+    """
+    unresolved = [s for s in sites
+                  if s.verdict in DESTRUCTIVE and dataset(s.path) is None]
+    doubted = []
+    if query is not None:
+        doubted = [s for s in sites
+                   if s.verdict in DESTRUCTIVE and s.doubts
+                   and dataset(s.path) is not None
+                   and not matches(s.path, query)]
+    return unresolved, doubted
+
+
 def report_lines(sites, query=None, destructive_only=False):
     """The whole report: grouped call sites, then the verdict, then caveats."""
     lines = []
@@ -746,6 +965,7 @@ def report_lines(sites, query=None, destructive_only=False):
         lines.append("")
 
     destroyers = [s for s in selected if s.verdict in DESTRUCTIVE]
+    unresolved, doubted = unsure(sites, query)
     if query is not None:
         if destroyers:
             lines.append("DESTROYED BY:")
@@ -755,16 +975,14 @@ def report_lines(sites, query=None, destructive_only=False):
         else:
             lines.append("DESTROYED BY: nothing in the scanned files empties "
                          "or drops %s" % query)
-        # A file that destroys the dataset is never listed as a reader, so the
-        # read-only list is safe to act on.
-        guilty = set(s.file for s in destroyers)
+        # A file that destroys the dataset, or might, is never listed as a
+        # reader, so the read-only list is safe to act on.
+        guilty = set(s.file for s in destroyers + unresolved + doubted)
         readers = sorted(set(s.file for s in selected
                              if s.verdict == READ and s.file not in guilty))
         if readers:
             lines.append("READ ONLY: %s" % ", ".join(readers))
 
-    unresolved = [s for s in sites
-                  if s.verdict in DESTRUCTIVE and dataset(s.path) is None]
     if unresolved:
         lines.append("")
         lines.append("%d destructive call site(s) whose target could not be "
@@ -772,17 +990,36 @@ def report_lines(sites, query=None, destructive_only=False):
                      % len(unresolved))
         for site in sorted(unresolved, key=lambda s: (s.file, s.line)):
             lines.extend(site_line(site))
+    if doubted:
+        lines.append("")
+        lines.append("%d destructive call site(s) shown against another "
+                     "dataset that another value may reach. The answer above "
+                     "is incomplete. Run with --rules to grade them:"
+                     % len(doubted))
+        for site in sorted(doubted, key=lambda s: (s.file, s.line)):
+            lines.extend(site_line(site))
+            lines.append("         why doubtful: %s"
+                         % "; ".join(WHY[r] for r in site.doubts))
     return lines
 
 
 def exit_code(sites, query, destructive_only, errors):
-    """0 nothing destructive reported, 1 something was, 2 the answer is partial."""
+    """0 nothing destructive reported, 1 something was, 2 the answer is partial.
+
+    The caveat blocks of the report count as reported: a run that prints
+    "the answer above is incomplete" over a destructive call site is not a
+    clean run.
+    """
     if errors:
         return 2
     selected = [s for s in sites if query is None or matches(s.path, query)]
     if destructive_only:
         selected = [s for s in selected if s.verdict in DESTRUCTIVE]
-    return 1 if any(s.verdict in DESTRUCTIVE for s in selected) else 0
+    unresolved, doubted = unsure(sites, query)
+    if any(s.verdict in DESTRUCTIVE for s in selected) or unresolved \
+            or doubted:
+        return 1
+    return 0
 
 
 # ------------------------------------------------------------ rules ownership
@@ -791,20 +1028,22 @@ def ownership(site, query):
     """(grade, reasons) when a call site may own the named dataset, else None.
 
     Owning means changing it: WRITE, EMPTY and DROP. A READ never owns, so a
-    reader is never graded at all. PROVEN needs a name that matches and a path
-    with no unknown piece and no doubt recorded while the file was walked.
-    Anything else that could still be this dataset is POSSIBLE with the
-    reasons, including a call site whose target name is unknown, because that
-    call site might be acting on the dataset asked about.
+    reader is never graded at all. PROVEN needs a name that matches, a path
+    that names its own workspace with no unknown piece, and no doubt recorded
+    while the file was walked. Anything else that could still be this dataset
+    is POSSIBLE with the reasons. That includes a call site whose target name
+    is unknown, and a call site that names another dataset on the strength of
+    a branch, a parameter or a rebound name: the walk keeps one value for such
+    a name, and the value that reaches the call may be another.
     """
     if site.verdict == READ:
         return None
     if dataset(site.path) is None:
         return POSSIBLE, (NO_TARGET,)
-    if not matches(site.path, query):
-        return None
     reasons = list(site.doubts)
-    if UNKNOWN in site.path:
+    if not matches(site.path, query):
+        return (POSSIBLE, tuple(reasons)) if reasons else None
+    if UNKNOWN in site.path or not anchored(site.path):
         reasons.insert(0, WORKSPACE)
     return (POSSIBLE if reasons else PROVEN), tuple(reasons)
 
@@ -858,18 +1097,32 @@ def rules_exit(sites, query, errors):
 
 # -------------------------------------------------------------- the io layer
 
-def walk_files(paths):
-    """Every source file under the given files and directories, sorted."""
+def walk_files(paths, errors=None):
+    """Every source file under the given files and directories, sorted.
+
+    A directory that cannot be listed, or that holds no source file, is
+    appended to errors. os.walk skips an unreadable folder without a word, and
+    a clean report over a folder nobody read is the worst answer to give.
+    """
+    errors = [] if errors is None else errors
     out = []
     for path in paths:
         if os.path.isfile(path):
             out.append(path)
             continue
-        for root, dirs, files in os.walk(path):
+        before = len(out)
+        failures = []
+        for root, dirs, files in os.walk(path, onerror=failures.append):
             dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
             for name in sorted(files):
                 if name.lower().endswith(SOURCE_SUFFIXES):
                     out.append(os.path.join(root, name))
+        for failure in failures:
+            errors.append((getattr(failure, "filename", None) or path,
+                           "could not be listed: %s"
+                           % failure.__class__.__name__))
+        if len(out) == before and not failures:
+            errors.append((path, "holds no .py, .pyt or .txt file"))
     return out
 
 
@@ -895,23 +1148,48 @@ def read_source(path):
         handle.close()
 
 
-def scan_paths(paths):
-    """Scan every source file under paths. Returns (sites, errors)."""
+def scan_files(files, explicit, skipped):
+    """Scan the given source files. Returns (sites, errors).
+
+    A .txt file found by walking a directory is often a note, not a script.
+    One that does not parse is appended to skipped instead of failing the run.
+    A file named on the command line is always held to the same standard.
+    """
     sites = []
     errors = []
-    for path in walk_files(paths):
+    for path in files:
         text = read_source(path)
         if text is None:
-            errors.append((path, "could not be read"))
+            errors.append((path, "could not be read, or is over %d bytes"
+                           % MAX_SOURCE_BYTES))
             continue
         try:
             sites.extend(scan_source(text, path))
-        except SyntaxError as exc:
-            errors.append((path, "line %s: %s" % (exc.lineno, exc.msg)))
-        except (ValueError, RecursionError) as exc:
+        except (SyntaxError, ValueError, RecursionError) as exc:
             # ast.parse raises ValueError on a null byte in the source, and a
             # generated file can nest deep enough to exhaust the stack.
-            errors.append((path, "could not be parsed: %s" % exc))
+            if path.lower().endswith(".txt") and path not in explicit:
+                skipped.append(path)
+            elif isinstance(exc, SyntaxError):
+                errors.append((path, "line %s: %s" % (exc.lineno, exc.msg)))
+            else:
+                errors.append((path, "could not be parsed: %s" % exc))
+    return sites, errors
+
+
+def scan_all(paths):
+    """(files, skipped, sites, errors) for everything under paths."""
+    errors = []
+    skipped = []
+    files = walk_files(paths, errors)
+    explicit = [p for p in paths if os.path.isfile(p)]
+    sites, more = scan_files(files, explicit, skipped)
+    return files, skipped, sites, errors + more
+
+
+def scan_paths(paths):
+    """Scan every source file under paths. Returns (sites, errors)."""
+    _, _, sites, errors = scan_all(paths)
     return sites, errors
 
 
@@ -1347,11 +1625,15 @@ def self_test():
     SearchCursor(r"D:\\gis\\water.gdb\\Mains", ["OID@"])
     """).verdict == READ,
           "a cursor imported by name is still a read")
-    check(one("""
+    starred = scan("""
     import arcpy
     arcpy.management.TruncateTable(*paths)
-    """) is None,
-          "a starred argument list names no dataset")
+    arcpy.management.DeleteRows(**KWARGS)
+    """)
+    check([(s.verdict, dataset(s.path)) for s in starred]
+          == [(EMPTY, None)] * 2,
+          "a starred argument list is a call site with no name, not a "
+          "missing one  <-- pinned defect")
 
     # ---- calls found in every place a statement can hide one
     nested = """
@@ -1752,7 +2034,7 @@ def self_test():
 
     def wipe():
         arcpy.management.TruncateTable(P)
-    """) == [(EMPTY, POSSIBLE, (BRANCH,))],
+    """) == [(EMPTY, POSSIBLE, (BRANCH, REBOUND))],
           "a doubtful module constant is doubtful inside a function")
 
     # A parameter is proven by its callers in these files and by no others.
@@ -2003,8 +2285,10 @@ def self_test():
         globals()["MAX_SOURCE_BYTES"] = 1
         oversize = scan_paths([big])
         globals()["MAX_SOURCE_BYTES"] = old_limit
-        check(oversize[1] == [(big, "could not be read")],
-              "a file the reader refuses is an error, never a clean answer")
+        check(len(oversize[1]) == 1 and oversize[1][0][0] == big
+              and oversize[1][0][1].startswith("could not be read, or is over"),
+              "a file the reader refuses is an error that says why, never a "
+              "clean answer")
 
         nulled = os.path.join(tmp, "nulled.py")
         handle = io.open(nulled, "wb")
@@ -2137,8 +2421,17 @@ def self_test():
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error. This tool uses 2 for an unreadable
+    file, so a usage error exits 64 as the documentation says."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="whowrites.py",
         description="Name every call site that empties, drops or rewrites a "
                     "feature class, and never name a reader as the thing "
@@ -2164,8 +2457,22 @@ def _parse(argv):
     return parser.parse_args(argv)
 
 
+def _printable():
+    """Make stdout and stderr print any character instead of raising.
+
+    A decoded path can hold a character the console code page cannot encode,
+    and the UnicodeEncodeError would end the run with a traceback and exit 1,
+    the code that means a destroyer was found.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
+
+
 def main(argv=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
+    _printable()
 
     if args.self_test:
         return self_test()
@@ -2186,9 +2493,16 @@ def main(argv=None):
               file=sys.stderr)
         return 64
 
-    files = walk_files(args.paths)
-    sites, errors = scan_paths(args.paths)
-    print("whowrites: %d file(s), %d call site(s)" % (len(files), len(sites)))
+    files, skipped, sites, errors = scan_all(args.paths)
+    read = len(files) - len(skipped)
+    if files and not read:
+        errors.append(("(all paths)", "every file found was skipped as not "
+                       "Python, so nothing was read"))
+    note = ""
+    if skipped:
+        note = ", %d .txt file(s) skipped as not Python" % len(skipped)
+    print("whowrites: %d file(s), %d call site(s)%s"
+          % (read, len(sites), note))
     print("")
     if args.rules:
         lines = rules_lines(sites, args.name, args.destructive_only)
