@@ -60,11 +60,12 @@ import warnings
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
 # =============================================================================
 
-# Extensions that are read as Python source. .pyt is an ArcGIS Python toolbox,
+# Extensions that are read as Python source. .pyw is a Windows script run
+# without a console window. .pyt is an ArcGIS Python toolbox,
 # which is a plain Python module with a fixed class shape. .txt is included
 # because script shares are full of .py files saved as .txt to get them past a
 # mail filter, and those still run when somebody renames them back.
-SOURCE_SUFFIXES = (".py", ".pyt", ".txt")
+SOURCE_SUFFIXES = (".py", ".pyw", ".pyt", ".txt")
 
 # Directories never walked. .git holds compressed objects, not source, and a
 # virtual environment holds thousands of files nobody in this tree wrote.
@@ -116,6 +117,7 @@ POSSIBLE = "POSSIBLE"
 BRANCH = "branch"
 PARAM = "parameter"
 REBOUND = "rebound"
+ROWS = "rows"
 WORKSPACE = "workspace"
 NO_TARGET = "target"
 WHY = {
@@ -125,6 +127,8 @@ WHY = {
            "scanned files may pass another one",
     REBOUND: "a module name is assigned more than once or through global, "
              "and a function sees the value it has when the call runs",
+    ROWS: "the file calls deleteRow, so this cursor may remove rows, and "
+          "the tool does not know which or how many",
     WORKSPACE: "the workspace is unknown, so a dataset of this name in "
                "another workspace could be the target",
     NO_TARGET: "the target name could not be resolved, so it could be "
@@ -164,6 +168,17 @@ TOOLS = {
     "intersect": (("in_features", 0, READ), ("out_feature_class", 1, WRITE)),
     "merge": (("inputs", 0, READ), ("output", 1, WRITE)),
     "project": (("in_dataset", 0, READ), ("out_dataset", 1, WRITE)),
+    "copy": (("in_data", 0, READ), ("out_data", 1, WRITE)),
+    "dissolve": (("in_features", 0, READ), ("out_feature_class", 1, WRITE)),
+    "erase": (("in_features", 0, READ), ("erase_features", 1, READ),
+              ("out_feature_class", 2, WRITE)),
+    "union": (("in_features", 0, READ), ("out_feature_class", 1, WRITE)),
+    "identity": (("in_features", 0, READ), ("identity_features", 1, READ),
+                 ("out_feature_class", 2, WRITE)),
+    "update": (("in_features", 0, READ), ("update_features", 1, READ),
+               ("out_feature_class", 2, WRITE)),
+    "spatialjoin": (("target_features", 0, READ), ("join_features", 1, READ),
+                    ("out_feature_class", 2, WRITE)),
 }
 
 # Two tools build their output from a folder-like argument and a name, as
@@ -479,6 +494,8 @@ class Site(object):
         self.line = line
         self.via = via
         self.detail = detail
+        # True for an UpdateCursor in a file that also calls deleteRow.
+        self.deletes = False
 
     def __repr__(self):
         return "Site(%s %s(%s) %s:%d %s)" % (
@@ -626,6 +643,31 @@ def handle_call(node, env, ctx, layers):
         _register_layer(ctx, key, node, env, first, first_doubts)
 
 
+def _scoped(node):
+    """{id of a call: names an enclosing comprehension or lambda binds}.
+
+    A comprehension target and a lambda parameter hide a module name of the
+    same spelling inside their own expression, as a function parameter does.
+    """
+    out = {}
+    for scope in ast.walk(node):
+        if isinstance(scope, (ast.ListComp, ast.SetComp, ast.DictComp,
+                              ast.GeneratorExp)):
+            bound = [n for gen in scope.generators
+                     for n in _stores(gen.target)]
+        elif isinstance(scope, ast.Lambda):
+            args = scope.args
+            bound = [a.arg for a in args.posonlyargs + args.args
+                     + args.kwonlyargs]
+            bound.extend(a.arg for a in (args.vararg, args.kwarg) if a)
+        else:
+            continue
+        for sub in ast.walk(scope):
+            if isinstance(sub, ast.Call):
+                out.setdefault(id(sub), set()).update(bound)
+    return out
+
+
 def visit_calls(node, env, ctx, layers):
     """Every call inside one expression or simple statement, in source order."""
     # A walrus binds a name this tool does not evaluate, so the old value of
@@ -633,9 +675,14 @@ def visit_calls(node, env, ctx, layers):
     for sub in ast.walk(node):
         if isinstance(sub, ast.NamedExpr):
             _unknown(ctx, env, [sub.target.id])
+    hidden = _scoped(node)
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
-            handle_call(sub, env, ctx, layers)
+            local = env
+            if id(sub) in hidden:
+                local = dict(env)
+                local.update(dict.fromkeys(hidden[id(sub)], UNKNOWN))
+            handle_call(sub, local, ctx, layers)
 
 
 def _unknown(ctx, env, names):
@@ -663,6 +710,13 @@ def _binds(node):
     for handler in getattr(node, "handlers", ()):
         if handler.name:
             out.append(handler.name)
+    # A match case binds the names its pattern captures.
+    for case in getattr(node, "cases", ()):
+        for sub in ast.walk(case.pattern):
+            for field in ("name", "rest"):
+                bound = getattr(sub, field, None)
+                if isinstance(bound, str):
+                    out.append(bound)
     return out
 
 
@@ -681,13 +735,15 @@ def _bodies(node):
             out.append((block, skipped))
     for handler in getattr(node, "handlers", []) or []:
         out.append((handler.body, True))
+    for case in getattr(node, "cases", []) or []:
+        out.append((case.body, True))
     return out
 
 
 def _heads(node):
     """The expressions a compound statement evaluates before its body."""
     out = []
-    for field in ("test", "iter"):
+    for field in ("test", "iter", "subject"):
         value = getattr(node, field, None)
         if value is not None:
             out.append(value)
@@ -911,6 +967,12 @@ def scan_source(text, filename):
     # Stable sort on the line alone, so two sites on one line keep the order
     # the tool's own parameters are declared in: inputs before target.
     final.sites.sort(key=lambda s: s.line)
+    # An UpdateCursor next to a deleteRow call may empty the table, and the
+    # tool cannot tell which rows. The flag keeps it out of the clean answers.
+    if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+           and n.func.attr == "deleteRow" for n in ast.walk(tree)):
+        for site in final.sites:
+            site.deletes = site.tool.lower() == "updatecursor"
     return final.sites
 
 
