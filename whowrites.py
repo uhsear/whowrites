@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Name every call site that empties, drops or rewrites a feature class, and never name a reader as the thing destroyed.
+"""Name every call site of a known arcpy data tool that empties, drops or writes a feature class, and never name a reader as the thing destroyed.
 
 A published layer comes up empty on a Monday morning. No geodatabase records
 who wrote to it, and a scheduled task records a command line and nothing else,
@@ -42,7 +42,8 @@ any piece of that claim rests on a guess. The two are never merged.
 Exit codes: 0 nothing destructive was reported, 1 a destructive call site was
 reported, 2 a file or directory could not be read, listed or parsed, or held
 no source, so the answer is incomplete, 3 (--rules only) no destructive call
-site is proven but one is possible, 64 usage error.
+site is proven but one is possible, 64 usage error, which includes a --name
+that no dataset name can match.
 """
 
 from __future__ import print_function
@@ -120,6 +121,7 @@ REBOUND = "rebound"
 ROWS = "rows"
 WORKSPACE = "workspace"
 NO_TARGET = "target"
+CONTAINER = "container"
 WHY = {
     BRANCH: "a name was assigned inside a branch, so another branch may "
             "give it another value",
@@ -129,6 +131,8 @@ WHY = {
              "and a function sees the value it has when the call runs",
     ROWS: "the file calls deleteRow, so this cursor may remove rows, and "
           "the tool does not know which or how many",
+    CONTAINER: "this deletes a whole geodatabase or feature dataset, and "
+               "the dataset may be inside it",
     WORKSPACE: "the workspace is unknown, so a dataset of this name in "
                "another workspace could be the target",
     NO_TARGET: "the target name could not be resolved, so it could be "
@@ -188,6 +192,13 @@ OUTPUT_PAIRS = {
     "featureclasstofeatureclass": ("out_path", 1, "out_name", 2),
     "tabletotable": ("out_path", 1, "out_name", 2),
 }
+
+# A Delete of a path that ends in one of these, or that names a feature
+# dataset, removes everything inside it. Per the Esri Delete page, "if the
+# specified item is a workspace, all contained items will also be deleted".
+# .sde is left out: deleting a connection file deletes no data.
+CONTAINER_SUFFIXES = (".gdb", ".mdb", ".gpkg")
+CONTAINER_TYPES = ("featuredataset",)
 
 # Tools that mint a layer or view name standing in for a dataset. The value is
 # (parameter name, positional index) of the NAME they create. A later
@@ -370,6 +381,8 @@ def const_value(node, env):
     if isinstance(node, ast.Call):
         if _os_join(node.func) and not node.keywords:
             parts = []
+            if not node.args:
+                return UNKNOWN
             for arg in node.args:
                 if isinstance(arg, ast.Starred):
                     return UNKNOWN
@@ -494,7 +507,8 @@ class Site(object):
         self.line = line
         self.via = via
         self.detail = detail
-        # True for an UpdateCursor in a file that also calls deleteRow.
+        # True for an UpdateCursor in a file that also calls deleteRow. Such a
+        # site may remove rows, so it counts as destructive (see may_remove).
         self.deletes = False
 
     def __repr__(self):
@@ -517,6 +531,9 @@ class _Ctx(object):
         # for a layer name. Both feed the POSSIBLE grade of --rules mode.
         self.taint = {}
         self.layer_doubt = {}
+        # Module names some function assigns through `global`. A module-level
+        # call can run that function before it reads the name.
+        self.globals = frozenset()
 
 
 def _doubts(node, ctx):
@@ -526,6 +543,25 @@ def _doubts(node, ctx):
         if isinstance(sub, ast.Name):
             out |= ctx.taint.get(sub.id, set())
     return out
+
+
+def _global_doubt(ctx, name):
+    """REBOUND for a name some function assigns through `global`."""
+    return set([REBOUND]) if name in ctx.globals else set()
+
+
+def _imported(ctx, env, node):
+    """An import rebinds the names it brings in, to values this tool cannot see.
+
+    `from settings import *` may rebind any name, so every known name goes
+    unknown. A star import of arcpy brings in tools and no path constants.
+    """
+    module = getattr(node, "module", None) or ""
+    for alias in node.names:
+        if alias.name != "*":
+            _unknown(ctx, env, [alias.asname or alias.name.split(".")[0]])
+        elif not (module == "arcpy" or module.startswith("arcpy.")):
+            _unknown(ctx, env, list(env))
 
 
 def _taint(ctx, name, reasons):
@@ -789,7 +825,8 @@ def walk_body(body, env, ctx, layers, skipped=False):
             for target in targets:
                 if isinstance(target, ast.Name):
                     env[target.id] = value
-                    _taint(ctx, target.id, reasons)
+                    _taint(ctx, target.id,
+                           reasons | _global_doubt(ctx, target.id))
                 else:
                     _unknown(ctx, env, _stores(target))
             continue
@@ -802,9 +839,13 @@ def walk_body(body, env, ctx, layers, skipped=False):
                     _taint(ctx, node.target.id,
                            _doubts(node.value, ctx)
                            | ctx.taint.get(node.target.id, set())
+                           | _global_doubt(ctx, node.target.id)
                            | (set([BRANCH]) if skipped else set()))
                 else:
                     _unknown(ctx, env, [node.target.id])
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            _imported(ctx, env, node)
             continue
         blocks = _bodies(node)
         if blocks:
@@ -817,23 +858,55 @@ def walk_body(body, env, ctx, layers, skipped=False):
         visit_calls(node, env, ctx, layers)
 
 
+def global_names(tree):
+    """Every name a function declares `global`."""
+    return frozenset(name for sub in ast.walk(tree)
+                     if isinstance(sub, ast.Global) for name in sub.names)
+
+
 def rebound_names(tree):
-    """Module names assigned more than once, or assigned through `global`."""
+    """Module names assigned more than once."""
     counts = {}
-    out = set()
     stack = list(tree.body)
     while stack:
         node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
                              ast.ClassDef)):
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.Global):
-                    out.update(sub.names)
             continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
             counts[node.id] = counts.get(node.id, 0) + 1
         stack.extend(ast.iter_child_nodes(node))
-    out.update(name for name, count in counts.items() if count > 1)
+    return set(name for name, count in counts.items() if count > 1)
+
+
+def enclosing_locals(tree):
+    """{function: names the functions around it bind}.
+
+    A nested function reads those names from its enclosing function, not from
+    the module, so a module constant of the same spelling must not answer.
+
+    # ponytail: the names resolve to unknown instead of to the value the
+    # enclosing function gave them. Upgrade path is to walk the outer function
+    # first and hand its environment to the inner one.
+    """
+    out = {}
+
+    def visit(node, bound):
+        for child in ast.iter_child_nodes(node):
+            inner = bound
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out[child] = bound
+                args = child.args
+                names = set(a.arg for a in args.posonlyargs + args.args
+                            + args.kwonlyargs)
+                names.update(a.arg for a in (args.vararg, args.kwarg) if a)
+                names.update(sub.id for sub in ast.walk(child)
+                             if isinstance(sub, ast.Name)
+                             and isinstance(sub.ctx, ast.Store))
+                inner = bound | (names - global_names(child))
+            visit(child, inner)
+
+    visit(tree, frozenset())
     return out
 
 
@@ -901,6 +974,41 @@ def derive_bindings(calls, defs):
     return out
 
 
+def holds_others(site, sites):
+    """True when deleting this path also deletes other datasets.
+
+    A geodatabase and a feature dataset hold datasets. So does any path that
+    another call site in the same file puts a dataset under.
+    """
+    last = dataset(site.path)
+    if last is None:
+        return False
+    if (last.lower().endswith(CONTAINER_SUFFIXES)
+            or (site.detail or "").lower() in CONTAINER_TYPES):
+        return True
+    parts = [p.lower() for p in split_path(site.path)]
+    for other in sites:
+        inner = [p.lower() for p in split_path(other.path)]
+        if len(inner) > len(parts) and inner[:len(parts)] == parts:
+            return True
+    return False
+
+
+def _flag_sites(tree, sites):
+    """Mark the call sites whose effect reaches past the dataset they name.
+
+    An UpdateCursor in a file that calls deleteRow may empty the table, and the
+    tool cannot tell which rows. A Delete of a container may remove the
+    dataset asked about without naming it.
+    """
+    removes = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr == "deleteRow" for n in ast.walk(tree))
+    for site in sites:
+        site.deletes = removes and site.tool.lower() == "updatecursor"
+        if site.verdict == DROP and holds_others(site, sites):
+            site.doubts = tuple(sorted(set(site.doubts) | set([CONTAINER])))
+
+
 def scan_source(text, filename):
     """Every classified arcpy call site in one Python source file.
 
@@ -918,10 +1026,13 @@ def scan_source(text, filename):
     imports = arcpy_imports(tree)
     defs, order = collect_defs(tree)
     rebound = rebound_names(tree)
+    declared = global_names(tree)
+    outer = enclosing_locals(tree)
 
     def replay(bindings, layers=None, doubts=None):
         ctx = _Ctx(filename, imports, defs)
         ctx.layer_doubt = dict(doubts or {})
+        ctx.globals = declared
         module_env = {}
         walk_body(tree.body, module_env, ctx, layers if layers else ctx.layers)
         module_taint = dict(ctx.taint)
@@ -934,6 +1045,9 @@ def scan_source(text, filename):
         for node in order:
             env = dict(module_env)
             ctx.taint = dict(module_taint)
+            for name in outer[node]:
+                env.pop(name, None)
+                ctx.taint.pop(name, None)
             # A parameter hides a module name of the same spelling. Without
             # this a function that takes `path` would read the module's
             # `path` as if the caller had passed it.
@@ -967,16 +1081,23 @@ def scan_source(text, filename):
     # Stable sort on the line alone, so two sites on one line keep the order
     # the tool's own parameters are declared in: inputs before target.
     final.sites.sort(key=lambda s: s.line)
-    # An UpdateCursor next to a deleteRow call may empty the table, and the
-    # tool cannot tell which rows. The flag keeps it out of the clean answers.
-    if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-           and n.func.attr == "deleteRow" for n in ast.walk(tree)):
-        for site in final.sites:
-            site.deletes = site.tool.lower() == "updatecursor"
+    _flag_sites(tree, final.sites)
     return final.sites
 
 
 # -------------------------------------------------------------- the report
+
+def may_remove(site):
+    """True when a call site empties, drops, or may delete rows."""
+    return site.verdict in DESTRUCTIVE or site.deletes
+
+
+def label(site):
+    """The verdict as the DESTROYED BY list prints it."""
+    if site.verdict in DESTRUCTIVE:
+        return site.verdict
+    return "%s, may delete rows" % site.verdict
+
 
 def site_line(site):
     """One report line for a call site, and one for its resolved path."""
@@ -993,16 +1114,16 @@ def unsure(sites, query):
     """(unresolved, doubted) destructive call sites the main list can miss.
 
     Unresolved sites have no dataset name. Doubted sites name another dataset
-    on the strength of a branch, a parameter or a rebound name, so the value
-    that reaches the call may be the one asked about. With no query every
-    site is already listed, so nothing is doubted.
+    on the strength of a branch, a parameter, a rebound name or a container
+    they empty, so the dataset asked about may be the one that is affected.
+    With no query every site is already listed, so nothing is doubted.
     """
     unresolved = [s for s in sites
-                  if s.verdict in DESTRUCTIVE and dataset(s.path) is None]
+                  if may_remove(s) and dataset(s.path) is None]
     doubted = []
     if query is not None:
         doubted = [s for s in sites
-                   if s.verdict in DESTRUCTIVE and s.doubts
+                   if may_remove(s) and s.doubts
                    and dataset(s.path) is not None
                    and not matches(s.path, query)]
     return unresolved, doubted
@@ -1013,7 +1134,7 @@ def report_lines(sites, query=None, destructive_only=False):
     lines = []
     selected = [s for s in sites if query is None or matches(s.path, query)]
     if destructive_only:
-        selected = [s for s in selected if s.verdict in DESTRUCTIVE]
+        selected = [s for s in selected if may_remove(s)]
 
     groups = {}
     for site in selected:
@@ -1026,22 +1147,22 @@ def report_lines(sites, query=None, destructive_only=False):
             lines.extend(site_line(site))
         lines.append("")
 
-    destroyers = [s for s in selected if s.verdict in DESTRUCTIVE]
+    destroyers = [s for s in selected if may_remove(s)]
     unresolved, doubted = unsure(sites, query)
     if query is not None:
         if destroyers:
             lines.append("DESTROYED BY:")
             for site in sorted(destroyers, key=lambda s: (s.file, s.line)):
                 lines.append("  %s:%d  %s  (%s)"
-                             % (site.file, site.line, site.tool, site.verdict))
+                             % (site.file, site.line, site.tool, label(site)))
         else:
             lines.append("DESTROYED BY: nothing in the scanned files empties "
                          "or drops %s" % query)
-        # A file that destroys the dataset, or might, is never listed as a
-        # reader, so the read-only list is safe to act on.
-        guilty = set(s.file for s in destroyers + unresolved + doubted)
+        # A file that writes the dataset, or might, is never listed as a
+        # reader. The rules report uses the same test, so the two agree.
+        owners = set(s.file for s in sites if ownership(s, query) is not None)
         readers = sorted(set(s.file for s in selected
-                             if s.verdict == READ and s.file not in guilty))
+                             if s.verdict == READ and s.file not in owners))
         if readers:
             lines.append("READ ONLY: %s" % ", ".join(readers))
 
@@ -1055,9 +1176,9 @@ def report_lines(sites, query=None, destructive_only=False):
     if doubted:
         lines.append("")
         lines.append("%d destructive call site(s) shown against another "
-                     "dataset that another value may reach. The answer above "
-                     "is incomplete. Run with --rules to grade them:"
-                     % len(doubted))
+                     "dataset that may still be, or hold, the one asked "
+                     "about. The answer above is incomplete. Run with --rules "
+                     "to grade them:" % len(doubted))
         for site in sorted(doubted, key=lambda s: (s.file, s.line)):
             lines.extend(site_line(site))
             lines.append("         why doubtful: %s"
@@ -1076,10 +1197,9 @@ def exit_code(sites, query, destructive_only, errors):
         return 2
     selected = [s for s in sites if query is None or matches(s.path, query)]
     if destructive_only:
-        selected = [s for s in selected if s.verdict in DESTRUCTIVE]
+        selected = [s for s in selected if may_remove(s)]
     unresolved, doubted = unsure(sites, query)
-    if any(s.verdict in DESTRUCTIVE for s in selected) or unresolved \
-            or doubted:
+    if any(may_remove(s) for s in selected) or unresolved or doubted:
         return 1
     return 0
 
@@ -1105,6 +1225,8 @@ def ownership(site, query):
     reasons = list(site.doubts)
     if not matches(site.path, query):
         return (POSSIBLE, tuple(reasons)) if reasons else None
+    if site.deletes:
+        reasons.append(ROWS)
     if UNKNOWN in site.path or not anchored(site.path):
         reasons.insert(0, WORKSPACE)
     return (POSSIBLE if reasons else PROVEN), tuple(reasons)
@@ -1126,7 +1248,7 @@ def rules_lines(sites, query, destructive_only=False):
             (PROVEN, "path resolved in full from literals in the file"),
             (POSSIBLE, "not ruled out, and not proven")):
         chosen = [g for g in graded if g[1] == grade
-                  and (not destructive_only or g[0].verdict in DESTRUCTIVE)]
+                  and (not destructive_only or may_remove(g[0]))]
         chosen.sort(key=lambda g: (SEVERITY[g[0].verdict], g[0].file,
                                    g[0].line))
         lines.append("%s (%s): %d call site(s)" % (grade, meaning,
@@ -1150,7 +1272,7 @@ def rules_exit(sites, query, errors):
     """2 partial, 1 a destroyer is proven, 3 one is only possible, else 0."""
     if errors:
         return 2
-    grades = [ownership(s, query) for s in sites if s.verdict in DESTRUCTIVE]
+    grades = [ownership(s, query) for s in sites if may_remove(s)]
     grades = [g[0] for g in grades if g is not None]
     if PROVEN in grades:
         return 1
@@ -1184,7 +1306,7 @@ def walk_files(paths, errors=None):
                            "could not be listed: %s"
                            % failure.__class__.__name__))
         if len(out) == before and not failures:
-            errors.append((path, "holds no .py, .pyt or .txt file"))
+            errors.append((path, "holds no .py, .pyw, .pyt or .txt file"))
     return out
 
 
@@ -1230,9 +1352,13 @@ def scan_files(files, explicit, skipped):
         except (SyntaxError, ValueError, RecursionError) as exc:
             # ast.parse raises ValueError on a null byte in the source, and a
             # generated file can nest deep enough to exhaust the stack.
-            if path.lower().endswith(".txt") and path not in explicit:
+            # A note that never mentions arcpy is skipped. One that does is a
+            # script this tool could not read, and a clean answer over it
+            # would be false. NULs are dropped so UTF-16 text still matches.
+            if (path.lower().endswith(".txt") and path not in explicit
+                    and "arcpy" not in text.replace("\x00", "").lower()):
                 skipped.append(path)
-            elif isinstance(exc, SyntaxError):
+            elif isinstance(exc, SyntaxError) and exc.lineno is not None:
                 errors.append((path, "line %s: %s" % (exc.lineno, exc.msg)))
             else:
                 errors.append((path, "could not be parsed: %s" % exc))
@@ -2161,6 +2287,403 @@ def self_test():
     check(layer_doubt[-1].via == "lyr" and layer_doubt[-1].doubts == (BRANCH,),
           "a layer made from a doubtful path passes the doubt to its delete")
 
+    # An UpdateCursor loop that calls deleteRow may empty the table.
+    cursor_src = """
+    import arcpy
+    with arcpy.da.UpdateCursor("D:/gis/w.gdb/Hydrants", ["OID@"]) as cur:
+        for row in cur:
+            cur.deleteRow()
+    """
+    check(graded(cursor_src) == [(WRITE, POSSIBLE, (ROWS,))],
+          "a cursor loop that deletes rows is POSSIBLE for rows, never a "
+          "plain PROVEN write  <-- pinned defect")
+    check(graded(cursor_src.replace("cur.deleteRow()", "pass"))
+          == [(WRITE, PROVEN, ())],
+          "the same cursor without deleteRow is a PROVEN write")
+    check(graded(cursor_src, "Mains") == [],
+          "a deleting cursor on another dataset is not graded")
+    rows_sites = scan(cursor_src, "rows.py")
+    check(rules_exit(rows_sites, "Hydrants", []) == 3,
+          "a cursor that may delete rows exits 3 in rules mode  "
+          "<-- pinned defect")
+    check(exit_code(rows_sites, "Hydrants", False, []) == 1,
+          "a cursor that may delete rows exits 1 in the default mode  "
+          "<-- pinned defect")
+    rows_text = "\n".join(report_lines(rows_sites, "Hydrants"))
+    check("(WRITE, may delete rows)" in rows_text
+          and "nothing in the scanned" not in rows_text,
+          "the default report names a deleting cursor under DESTROYED BY  "
+          "<-- pinned defect")
+    check("deleteRow" in "\n".join(rules_lines(rows_sites, "Hydrants", True)),
+          "--destructive-only keeps a cursor that may delete rows")
+    check(exit_code(scan("""
+    import arcpy
+    def go(path):
+        with arcpy.da.UpdateCursor(path, ["OID@"]) as cur:
+            cur.deleteRow()
+    """), "Hydrants", False, []) == 1,
+          "a deleting cursor on an unresolved path is a caveat, not a clean "
+          "answer")
+    check(not any(s.deletes for s in scan("""
+    import arcpy
+    with arcpy.da.SearchCursor("D:/gis/w.gdb/Hydrants", ["OID@"]) as cur:
+        other.deleteRow()
+    """)), "only an UpdateCursor is flagged as deleting rows")
+
+    # A nested function reads its enclosing function, not the module.
+    closure = """
+    import arcpy
+    FC = "D:/gis/w.gdb/Hydrants"
+    def outer():
+        FC = "D:/gis/w.gdb/Scratch"
+        def inner():
+            arcpy.management.TruncateTable(FC)
+        inner()
+    """
+    check(graded(closure) == [(EMPTY, POSSIBLE, (NO_TARGET,))]
+          and graded(closure, "Scratch") == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a name bound by the enclosing function hides the module constant "
+          "in a nested function  <-- pinned defect")
+    check(graded(closure.replace("def outer():", "def outer(FC):")
+                 .replace('        FC = "D:/gis/w.gdb/Scratch"\n', ""))
+          == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a parameter of the enclosing function hides it too")
+    check(graded(closure.replace('FC = "D:/gis/w.gdb/Scratch"', "n = 1"))
+          == [(EMPTY, PROVEN, ())],
+          "a nested function still reads a module name nobody hides")
+    check(graded(closure.replace('FC = "D:/gis/w.gdb/Scratch"',
+                                 'global FC; FC = "D:/gis/w.gdb/Hydrants"'))
+          == [(EMPTY, POSSIBLE, (REBOUND,))],
+          "a global declaration in the enclosing function hides nothing")
+
+    # An import rebinds a name to a value this file does not hold.
+    imp_stale = """
+    import arcpy
+    TARGET = "D:/gis/w.gdb/Hydrants"
+    from settings import TARGET
+    arcpy.management.TruncateTable(TARGET)
+    """
+    check(graded(imp_stale) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a module constant rebound by an import keeps no stale value  "
+          "<-- pinned defect")
+    check(graded(imp_stale.replace("import TARGET", "import *"))
+          == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a star import forgets every module constant  <-- pinned defect")
+    check(graded("""
+    import arcpy
+    TARGET = "D:/gis/w.gdb/Other"
+    try:
+        from local_settings import TARGET
+    except ImportError:
+        pass
+    arcpy.management.TruncateTable(TARGET)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "an override import in a try block can make Other into Hydrants  "
+          "<-- pinned defect")
+    check(graded("""
+    import arcpy
+    from arcpy import *
+    P = "D:/gis/w.gdb/Hydrants"
+    from arcpy import *
+    import os.path
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, PROVEN, ())],
+          "a star import of arcpy brings in no path constant")
+    check(graded("""
+    import arcpy
+    TARGET = "D:/gis/w.gdb/Hydrants"
+    from settings import TARGET
+
+    def wipe():
+        arcpy.management.TruncateTable(TARGET)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a function sees the imported value, not the stale literal")
+
+    # A function that sets a global runs before the module-level call.
+    glob_src = """
+    import arcpy
+    P = "D:/gis/w.gdb/Roads"
+    def f():
+        global P
+        P = "D:/gis/w.gdb/Hydrants"
+    f()
+    arcpy.management.TruncateTable(P)
+    """
+    check(graded(glob_src) == [(EMPTY, POSSIBLE, (REBOUND,))]
+          and graded(glob_src, "Roads") == [(EMPTY, POSSIBLE, (REBOUND,))],
+          "a module-level call after a function that sets the global is "
+          "POSSIBLE for both names  <-- pinned defect")
+    check(exit_code(scan(glob_src), "Hydrants", False, []) == 1
+          and rules_exit(scan(glob_src), "Hydrants", []) == 3,
+          "the swapped global is never a clean exit in either mode  "
+          "<-- pinned defect")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb"
+    def f():
+        global P
+        P = "D:/gis/x.gdb"
+    P += "/Hydrants"
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (REBOUND,))],
+          "extending a name that a function sets through global is doubtful")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/Roads"
+    def f():
+        global P
+        P = "D:/gis/w.gdb/Hydrants"
+    def g():
+        arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (REBOUND,))],
+          "a function that reads a global another function sets is doubtful"
+          "  <-- pinned defect")
+
+    # Deleting a container deletes what is inside it.
+    parent_src = """
+    import arcpy
+    STAGE = "D:/gis/stage.gdb"
+    arcpy.management.Delete(STAGE)
+    arcpy.management.CopyFeatures("D:/x.gdb/Hydrants", STAGE + "/Hydrants")
+    """
+    check(graded(parent_src) == [(DROP, POSSIBLE, (CONTAINER,)),
+                                 (WRITE, PROVEN, ())],
+          "deleting the geodatabase that holds the dataset is POSSIBLE  "
+          "<-- pinned defect")
+    check(graded(parent_src, "Anything") == [(DROP, POSSIBLE, (CONTAINER,))],
+          "a deleted geodatabase might hold any dataset")
+    parent_sites = scan(parent_src, "parent.py")
+    check(exit_code(parent_sites, "Hydrants", False, []) == 1
+          and rules_exit(parent_sites, "Laterals", []) == 3,
+          "a deleted container is never a clean exit  <-- pinned defect")
+    check("that may still be, or hold, the one asked about" in
+          "\n".join(report_lines(parent_sites, "Laterals")),
+          "the default report lists the deleted container as a caveat")
+    check(graded("""
+    import arcpy
+    arcpy.management.Delete("D:/gis/w.gdb/Water", "FeatureDataset")
+    """) == [(DROP, POSSIBLE, (CONTAINER,))],
+          "a feature dataset holds datasets")
+    check(graded("""
+    import arcpy
+    arcpy.management.Delete("D:/gis/w.gdb/Water")
+    arcpy.management.CopyFeatures("D:/x.gdb/Hydrants", "D:/gis/w.gdb/Water/Hydrants")
+    """) == [(DROP, POSSIBLE, (CONTAINER,)), (WRITE, PROVEN, ())],
+          "a path another call site puts a dataset under is a container")
+    check(graded("""
+    import arcpy
+    arcpy.management.Delete("D:/gis/w.gdb/Mains")
+    arcpy.management.Delete("D:/gis/u.sde")
+    arcpy.management.CopyFeatures("D:/x.gdb/Hydrants", "D:/gis/w.gdb")
+    """) == [],
+          "a plain feature class, and a connection file, hold nothing")
+    check(scan("""
+    import arcpy
+    arcpy.management.Delete(UNSET)
+    """)[0].doubts == (),
+          "an unresolved delete is not called a container")
+
+    # The default report lists a writer as a writer.
+    writer_src = """
+    import arcpy
+    P = "D:/gis/w.gdb/Hydrants"
+    arcpy.management.CalculateField(P, "x", "1")
+    arcpy.management.GetCount(P)
+    """
+    owner_lines = report_lines(
+        scan(writer_src, "editor.py") + scan(compare, "compare.py"),
+        "Hydrants")
+    check("READ ONLY: compare.py" in owner_lines,
+          "a file that writes the dataset is not read only in the default "
+          "report  <-- pinned defect")
+
+    # A branch value can be the dataset asked about.
+    branch_src = """
+    import arcpy
+    if FLAG:
+        P = "D:/gis/w.gdb/Hydrants"
+    else:
+        P = "D:/gis/w.gdb/Other"
+    arcpy.management.TruncateTable(P)
+    """
+    branch_sites = scan(branch_src, "branch.py")
+    branch_text = "\n".join(report_lines(branch_sites, "Hydrants"))
+    check(exit_code(branch_sites, "Hydrants", False, []) == 1
+          and "why doubtful: a name was assigned inside a branch"
+          in branch_text,
+          "a destroyer seen only through a branch is a caveat, not a clean "
+          "exit  <-- pinned defect")
+
+    # A bare name depends on a workspace this file may never set.
+    check([anchored(p) for p in ("D:/a/b", "/a/b", "w.gdb/Hy", "in_memory/Hy",
+                                 "Hy", "a/b")]
+          == [True, True, True, True, False, False],
+          "a path is anchored by a drive, a root, a workspace or in_memory")
+    check(graded("""
+    import arcpy
+    arcpy.management.TruncateTable("Hydrants")
+    arcpy.management.DeleteRows("w.gdb/Hydrants")
+    """) == [(EMPTY, POSSIBLE, (WORKSPACE,)), (EMPTY, PROVEN, ())],
+          "a bare name under an unset workspace is POSSIBLE, not PROVEN  "
+          "<-- pinned defect")
+
+    # Ways of naming a tool, and shapes of argument the resolver must survive.
+    check(graded("""
+    import arcpy
+    from arcpy import *
+    from arcpy.management import TruncateTable as trunc
+    fn = arcpy.management.DeleteRows
+    getattr(arcpy, "TruncateTable_management")("D:/a.gdb/Hydrants")
+    trunc("D:/a.gdb/Hydrants")
+    fn("D:/a.gdb/Hydrants")
+    Delete("D:/a.gdb/Hydrants")
+    """) == [(EMPTY, PROVEN, ())] * 3 + [(DROP, PROVEN, ())],
+          "a getattr name, an import alias, a saved tool and a star import "
+          "are all the tool")
+    check(graded("""
+    import arcpy
+    arcpy.conversion.FeatureClassToFeatureClass("D:/a.gdb/Src", "D:/b.gdb", "Hydrants")
+    arcpy.conversion.TableToTable("D:/a.gdb/Src", "D:/b.gdb")
+    arcpy.management.Append(*ARGS)
+    """) == [(WRITE, PROVEN, ()), (WRITE, POSSIBLE, (NO_TARGET,)),
+             (WRITE, POSSIBLE, (NO_TARGET,))],
+          "an output folder and name are joined, and a missing one is "
+          "unresolved")
+    check(graded("""
+    import arcpy
+    P = "D:/a.gdb/Hydrants"
+    [arcpy.management.TruncateTable(P) for P in ITEMS]
+    f = lambda P: arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))] * 2,
+          "a comprehension target and a lambda parameter hide the module "
+          "name")
+    check(graded("""
+    import arcpy
+    P = "D:/a.gdb/Hydrants"
+    x: int
+    y: int = 2
+    a.b = 3
+    a.b += "x"
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, PROVEN, ())],
+          "an annotation, an attribute assignment and an attribute += leave "
+          "the name alone")
+    check(graded("""
+    import arcpy
+    P = "D:/a.gdb/Hydrants"
+    if (P := OTHER):
+        pass
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a walrus forgets the old value")
+    check(graded("""
+    import arcpy
+    P = "D:/a.gdb/Hydrants"
+    try:
+        pass
+    except Exception as P:
+        pass
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "an except target forgets the old value")
+    check(graded("""
+    import arcpy
+    P = "D:/a.gdb/Hydrants"
+    with open("x"):
+        pass
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, PROVEN, ())],
+          "a with statement that binds nothing leaves the name alone")
+    match_src = """
+    import arcpy
+    P = "D:/a.gdb/Hydrants"
+    Q = "D:/a.gdb/Hydrants"
+    match CMD:
+        case [P, *rest]:
+            arcpy.management.TruncateTable(P)
+        case {"k": Q, **others}:
+            arcpy.management.TruncateTable(Q)
+    """
+    check(not hasattr(ast, "Match")
+          or graded(match_src) == [(EMPTY, POSSIBLE, (NO_TARGET,))] * 2,
+          "a match case binds the names its pattern captures")
+    check(render(scan("""
+    import arcpy, os
+    arcpy.management.TruncateTable(os.path.join())
+    """)[0].path) == "?",
+          "os.path.join with no argument is unknown, not an empty path  "
+          "<-- pinned defect")
+
+    # Report and exit shapes that a wrong branch would still print.
+    loader_text = "\n".join(report_lines(scan(loader, "loader.py"),
+                                          "Hydrants"))
+    check("(EMPTY)" in loader_text and "may delete rows" not in loader_text
+          and "READ ONLY" not in loader_text
+          and "could not be resolved" not in loader_text
+          and "may still be, or hold" not in loader_text,
+          "a report with a destroyer and nothing else prints no caveat and "
+          "no empty reader list")
+    reader_text = "\n".join(report_lines(scan(compare, "compare.py"),
+                                          "Hydrants"))
+    check("READ ONLY: compare.py" in reader_text
+          and "nothing in the scanned files empties" in reader_text,
+          "a reader is listed as one, and nothing is reported destroyed")
+    check(len(report_lines(branch_sites)) > 0
+          and exit_code(branch_sites, None, False, []) == 1,
+          "a report without --name can hold a doubtful site")
+    loader_rules = "\n".join(rules_lines(scan(loader, "loader.py"), "Hydrants"))
+    check("why possible" not in loader_rules and "READ ONLY" not in loader_rules,
+          "a proven site gives no reason, and no reader list is printed "
+          "when there is no reader")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/Hydrants"
+    P -= "x"
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "an augmented assignment other than += forgets the name")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/Hydrants"
+    def other():
+        P = "D:/gis/w.gdb/Roads"
+    def wipe():
+        arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, PROVEN, ())],
+          "a local assignment in another function does not rebind the module "
+          "name")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/Hydrants"
+    for P in ITEMS:
+        pass
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a loop target forgets the old value")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/Hydrants"
+    with open("x") as P:
+        pass
+    arcpy.management.TruncateTable(P)
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))],
+          "a with target forgets the old value")
+    check(graded("""
+    import arcpy
+    P = "D:/gis/w.gdb/%s" % "Hydrants"
+    arcpy.management.TruncateTable(P)
+    arcpy.management.TruncateTable(os.path.join(*PARTS))
+    """) == [(EMPTY, POSSIBLE, (NO_TARGET,))] * 2,
+          "% formatting and a starred os.path.join are unresolved")
+
+    # --name must be able to match something.
+    check([bad_name(n) is not None for n in
+           ("", " Hydrants", "Hydrants ", "D:/a.gdb/Hydrants",
+            "a.gdb\\Hydrants")] == [True] * 5
+          and bad_name("Hydrants") is None and bad_name(None) is None,
+          "an empty name, stray whitespace or a path is refused  "
+          "<-- pinned defect")
+
     # The report.
     ws_src = """
     import arcpy
@@ -2305,7 +2828,7 @@ def self_test():
         check(all(f.endswith(".py") for f in files),
               "every walked file is a source file")
         sites, errors = scan_paths([tmp])
-        check(len(errors) == 1 and "line 1" in errors[0][1],
+        check(len(errors) == 1 and errors[0][1].startswith("line 1:"),
               "the unparsable file is reported once, with its line")
         check(any(s.verdict == EMPTY and dataset(s.path)
                   == "WATERWORKS.PUBLIC.Hydrants" for s in sites),
@@ -2416,6 +2939,20 @@ def self_test():
             printed = sys.stdout.getvalue()
         finally:
             sys.stdout, sys.stderr = quiet, loud
+        quiet, loud = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        try:
+            default_ws = main([os.path.join(tmp, "ws.py"), "--name",
+                               "Hydrants"])
+            bad_names = [main([tmp, "--name", n])
+                         for n in ("", "D:/a.gdb/Hydrants")]
+        finally:
+            sys.stdout, sys.stderr = quiet, loud
+        check(default_ws == 1,
+              "main without --rules never returns 3  <-- pinned defect")
+        check(bad_names == [64, 64],
+              "main refuses a --name that can match nothing  "
+              "<-- pinned defect")
         check(codes[0] == 1 and "PROVEN (" in printed,
               "main --rules reports 1 and prints the graded report")
         check(codes[1] == 0,
@@ -2426,6 +2963,65 @@ def self_test():
               "main --rules reports 2 when one file in the directory is broken")
         check(codes[4] == 64,
               "main --rules without --name is a usage error")
+
+        # A walked folder: notes are skipped, scripts that do not parse are not.
+        listing = os.path.join(tmp, "listing")
+        os.mkdir(listing)
+        write(os.path.join("listing", "script.py"), loader)
+        write(os.path.join("listing", "note.txt"), "a note about Hydrants\n")
+        found = scan_all([listing])
+        check(len(found[0]) == 2 and len(found[1]) == 1 and found[3] == [],
+              "a .txt note that never mentions arcpy is skipped, not an "
+              "error")
+        write(os.path.join("listing", "old.txt"),
+              "import arcpy\nprint 'x'\n")
+        handle = io.open(os.path.join(listing, "wide.txt"), "wb")
+        handle.write(u"import arcpy\nprint 1\n".encode("utf-16"))
+        handle.close()
+        found = scan_all([listing])
+        check(len(found[1]) == 1 and sorted(
+            os.path.basename(e[0]) for e in found[3]) == ["old.txt",
+                                                          "wide.txt"],
+              "a .txt script that mentions arcpy, even in UTF-16, and does "
+              "not parse is an error  <-- pinned defect")
+
+        notes_only = os.path.join(tmp, "notes_only")
+        os.mkdir(notes_only)
+        write(os.path.join("notes_only", "note.txt"), "a note\n")
+        mixed = os.path.join(tmp, "mixed")
+        os.mkdir(mixed)
+        write(os.path.join("mixed", "script.py"), loader)
+        write(os.path.join("mixed", "note.txt"), "a note\n")
+        quiet, loud = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        try:
+            note_code = main([notes_only, "--name", "Hydrants"])
+            note_err = sys.stderr.getvalue()
+            sys.stderr = io.StringIO()
+            mixed_code = main([mixed, "--name", "Hydrants"])
+            mixed_out = sys.stdout.getvalue()
+        finally:
+            sys.stdout, sys.stderr = quiet, loud
+        check(note_code == 2 and "every file found was skipped" in note_err,
+              "a folder of nothing but notes is exit 2, never a clean answer"
+              "  <-- pinned defect")
+        check("1 .txt file(s) skipped as not Python" in mixed_out
+              and mixed_code == 1,
+              "a skipped note is counted on the header line")
+
+        gone = walk_files([os.path.join(tmp, "gone")], [])
+        lost = []
+        walk_files([os.path.join(tmp, "gone")], lost)
+        empty = os.path.join(tmp, "empty_dir")
+        os.mkdir(empty)
+        bare = []
+        walk_files([empty], bare)
+        check(gone == [] and len(lost) == 1
+              and "could not be listed" in lost[0][1],
+              "a folder that cannot be listed is an error, not a clean "
+              "answer")
+        check(len(bare) == 1 and "holds no" in bare[0][1],
+              "a folder with no source file is an error")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     check(not os.path.isdir(tmp), "the self-test leaves no directory behind")
@@ -2495,9 +3091,9 @@ class _Parser(argparse.ArgumentParser):
 def _parse(argv):
     parser = _Parser(
         prog="whowrites.py",
-        description="Name every call site that empties, drops or rewrites a "
-                    "feature class, and never name a reader as the thing "
-                    "destroyed.",
+        description="Name every call site of a known arcpy data tool that "
+                    "empties, drops or writes a feature class, and never name "
+                    "a reader as the thing destroyed.",
         epilog="This tool reads source code. It changes nothing.",
         allow_abbrev=False,
     )
@@ -2517,6 +3113,21 @@ def _parse(argv):
     parser.add_argument("--self-test", dest="self_test", action="store_true",
                         help="run the assertions and exit")
     return parser.parse_args(argv)
+
+
+def bad_name(name):
+    """Why --name can match no dataset, or None when it can.
+
+    A query that holds a path separator, or is empty, or has stray whitespace,
+    matches nothing, and the report would say nothing destroys it.
+    """
+    if name is None:
+        return None
+    if name == "" or name != name.strip():
+        return "is empty or has leading or trailing whitespace"
+    if SEP_RE.search(name):
+        return "holds a path separator"
+    return None
 
 
 def _printable():
@@ -2546,6 +3157,11 @@ def main(argv=None):
     if args.rules and args.name is None:
         print("error: --rules grades ownership of one dataset. Pass --name.",
               file=sys.stderr)
+        return 64
+    bad = bad_name(args.name)
+    if bad:
+        print("error: --name %s. Pass the dataset name alone, for example "
+              "Hydrants." % bad, file=sys.stderr)
         return 64
     missing = [p for p in args.paths if not os.path.exists(p)]
     if missing:

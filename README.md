@@ -1,6 +1,6 @@
 # whowrites
 
-Name every call site that empties, drops or rewrites a feature class, and never name a reader as the thing destroyed.
+Name every call site of a known arcpy data tool that empties, drops or writes a feature class, and never name a reader as the thing destroyed.
 
 The published hydrant layer comes up empty on a Monday morning. The geodatabase records nothing
 about who wrote to it. The scheduled task recorded a command line and an exit code. The only
@@ -86,6 +86,22 @@ PASS  a path bound through a parameter is POSSIBLE, because a caller outside the
 ...
 PASS  a parameter hides a module constant of the same name  <-- pinned defect
 ...
+PASS  a cursor loop that deletes rows is POSSIBLE for rows, never a plain PROVEN write  <-- pinned defect
+...
+PASS  a cursor that may delete rows exits 3 in rules mode  <-- pinned defect
+...
+PASS  a name bound by the enclosing function hides the module constant in a nested function  <-- pinned defect
+...
+PASS  a module constant rebound by an import keeps no stale value  <-- pinned defect
+...
+PASS  a module-level call after a function that sets the global is POSSIBLE for both names  <-- pinned defect
+...
+PASS  deleting the geodatabase that holds the dataset is POSSIBLE  <-- pinned defect
+...
+PASS  a file that writes the dataset is not read only in the default report  <-- pinned defect
+...
+PASS  an empty name, stray whitespace or a path is refused  <-- pinned defect
+...
 PASS  only the file that might not write the dataset is read only  <-- pinned defect
 ...
 PASS  a destroyer that is only possible exits 3, apart from 1  <-- pinned defect
@@ -93,7 +109,7 @@ PASS  a destroyer that is only possible exits 3, apart from 1  <-- pinned defect
 PASS  a unique prefix of --destructive-only is refused by the parser  <-- pinned defect
 PASS  a prefix of --rules is refused, and no write flag exists to abbreviate  <-- pinned defect
 ...
-PASS  a file the reader refuses is an error, never a clean answer
+PASS  a file the reader refuses is an error that says why, never a clean answer
 PASS  a null byte in the source is an error, not a traceback
 PASS  a file that nests deeper than the parser is an error, not a traceback  <-- pinned defect
 PASS  a byte order mark does not break the parse  <-- pinned defect
@@ -101,13 +117,19 @@ PASS  main reports 2 when one file in the directory is broken
 PASS  main reports 1 when it names a destroyer
 PASS  main reports 0 when only readers touch the dataset
 ...
+PASS  main without --rules never returns 3  <-- pinned defect
+...
 PASS  main --rules reports 3 when the only owner is possible
+...
+PASS  a .txt script that mentions arcpy, even in UTF-16, and does not parse is an error  <-- pinned defect
+PASS  a folder of nothing but notes is exit 2, never a clean answer  <-- pinned defect
 ...
 PASS  the self-test leaves no directory behind
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
+...
 --------------------------------------------------------------------
-179 assertions, 0 failed
+240 assertions, 0 failed
 ```
 
 ## What already exists
@@ -123,9 +145,13 @@ PASS  check() and raises() really do record a failure  <-- pinned defect
   That second point is an inference from the tool description, which says the tool removes all
   rows. It was not tested here, because the tool needs a database.
 
-A GitHub search on 2026-10-22 for this name, and for arcpy, truncate and lineage keywords, found no
-repository that does the same job. The two repositories with a similar name are unrelated: one
-has an empty description and HTML as its language, the other is JavaScript.
+A GitHub search on 2026-10-30 for this name (`gh search repos whowrites`) found no repository that
+does the same job. Three repositories have a similar name and are unrelated: `drmuratok/whowriteswho`,
+`whowriteswho/whowriteswho.github.io` and `adtyapnda/WhoWrites`. None has a description that
+mentions arcpy, and their languages are listed as HTML or none. A search for `arcpy` sorted by stars
+(`gh search repos arcpy --sort stars`) returned map matching, metadata editing, REST wrappers, a
+geodatabase report generator and sample toolboxes. That does not prove that no tool like this
+exists, only that none turned up.
 
 ## Requirements
 
@@ -137,10 +163,13 @@ a laptop that has no ArcGIS licence and no connection to the database you are as
 git clone https://github.com/uhsear/whowrites.git
 ```
 
-The self-test reports 179 assertions, and the count is the same on every interpreter it was run
-on: Python 3.9.25, 3.10.20, 3.12 and 3.13.2 on Windows, and Python 3.12.3 on Linux. The source
-uses no f-strings and no syntax added after Python 3.8. Branch coverage is 100 percent (913
-statements, 302 branches), measured on Windows with
+The self-test reports 240 assertions, and the count is the same on every interpreter it was run
+on: Python 3.9.25, 3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux. The
+transcript is byte for byte the same on Windows 3.13.2 and Linux 3.12.3 once the line endings are
+stripped. The source uses no f-strings and no syntax added after Python 3.8. The one assertion
+that needs a `match` statement passes without running on Python 3.9, so the count stays equal.
+Branch coverage is 100 percent (1288 statements, 446 branches), measured on Windows with Python
+3.13.2 and
 `python -m coverage run --branch whowrites.py --self-test`. The Linux host has no `coverage`
 module, so coverage was not measured there. No line is excluded from the measurement.
 
@@ -264,7 +293,7 @@ call emptied the published layer. The default report cannot say which. That is w
 | Flag | Default | What it does |
 |---|---|---|
 | `PATHS` | none | Python files or directories to read. Required. |
-| `--name` | none | Report only the call sites against this dataset name. Owner qualified or not, case insensitive. |
+| `--name` | none | Report only the call sites against this dataset name. Owner qualified or not, case insensitive. A name that is empty, has stray whitespace or holds a path separator is refused with exit 64. |
 | `--destructive-only` | off | Report only the call sites that empty or drop a dataset. |
 | `--rules` | off | Grade each call site that may own `--name` as PROVEN or POSSIBLE, and report the two apart. Needs `--name`. |
 | `--self-test` | off | Run the offline assertions and exit. |
@@ -311,10 +340,11 @@ A call site is graded `PROVEN` only when all of these hold:
 1. The call site is not a read.
 2. The path resolved from literals in the file, with no unknown piece.
 3. The last segment answers to the name, by the same whole-segment match as the default report.
-4. No name in the path got its value inside a branch, or through a parameter.
+4. No name in the path got its value inside a branch, through a parameter, or from a name that
+   something else can reassign (see the reasons below).
 
 Anything else that could still be the dataset is `POSSIBLE`, and each possible call site prints
-why. There are four reasons:
+why. There are seven reasons:
 
 | Reason | When |
 |---|---|
@@ -322,6 +352,9 @@ why. There are four reasons:
 | workspace unknown | The name matches, but part of the path before it is `?`, so a dataset of that name in another workspace could be the target. |
 | branch | A name was assigned inside an `if` arm, a loop body or an `except` handler. The walk keeps the last value it saw, which may not be the one that ran. |
 | parameter | The path reached the call through a function parameter. Every call in the scanned files passes it, but a caller in another file could pass something else. |
+| rebound | A module name is assigned more than once, or a function assigns it through `global`. A function reads the value the name has when the call runs, and a module-level call can run after a function changed it. |
+| rows | An `UpdateCursor` in a file that calls `deleteRow`. The cursor may remove rows, and the tool does not know which or how many. |
+| container | A `Delete` of a geodatabase (`.gdb`, `.mdb`, `.gpkg`), of a path that `data_type` calls a `FeatureDataset`, or of a path another call site in the same file puts a dataset under. It may remove the dataset you asked about without naming it. |
 
 The reasons travel. A name built from a doubtful name by `+`, by an f-string or by `os.path.join`
 is doubtful. A layer made from a doubtful path passes the doubt to the `DeleteFeatures` that uses
@@ -330,10 +363,12 @@ run on the normal path, so they do not count as branches.
 
 `READ ONLY` lists a file only when it has no call site that is proven or possible. In the output
 above, `change_report.py` is the only one. A file with an unresolved write is never listed as a
-reader, even when it also reads the dataset.
+reader, even when it also reads the dataset. The default report prints the same list with the same
+test, so a file that runs `CalculateField` on the dataset is not labelled read only in either mode.
 
 `--destructive-only` works with `--rules`. It hides the proven and possible `WRITE` sites, and it
-does not turn a file with a hidden writer into a reader.
+does not turn a file with a hidden writer into a reader. It keeps an `UpdateCursor` that may delete
+rows, because that site may empty the dataset.
 
 Run on only the two scripts that cannot be proven, the tool exits 3 (checked with `echo $?`):
 
@@ -357,21 +392,48 @@ POSSIBLE (not ruled out, and not proven): 3 call site(s)
          why possible: the workspace is unknown, so a dataset of this name in another workspace could be the target
 ```
 
-This release also fixed one defect in both modes. A function parameter named like a module
-constant used to resolve to the constant. `def wipe(P)` beside a module-level `P = ".../Hydrants"`
-was reported as truncating `Hydrants`, when the caller chose the path. The parameter now hides the
-constant, and the self-test pins it.
+This release fixed these defects in both modes. The self-test pins each one.
+
+- A function parameter named like a module constant used to resolve to the constant. `def wipe(P)`
+  beside a module-level `P = ".../Hydrants"` was reported as truncating `Hydrants`, when the caller
+  chose the path. The parameter now hides the constant. A name bound by an enclosing function hides
+  it in a nested function in the same way.
+- An `UpdateCursor` loop that calls `deleteRow` used to be a plain `WRITE`. The report said nothing
+  emptied the layer, and the exit code was 0. It is now listed under `DESTROYED BY` as
+  `(WRITE, may delete rows)` and exits 1, and `--rules` grades it `POSSIBLE` with the reason `rows`
+  and exits 3.
+- `Delete` of a geodatabase used to be reported against the geodatabase only. It is now a caveat
+  for every dataset name (reason `container`).
+- A module constant that is later rebound by `from settings import TARGET` or by a star import used
+  to keep its first literal. It is now unknown, and the call site is `POSSIBLE` with an unresolved
+  target.
+- A function that assigns a module name through `global` used to leave the stale literal in place
+  for module-level calls after it. The call site is now `POSSIBLE` with the reason `rebound`.
+- The default report used to print `READ ONLY` for a file that wrote the dataset without
+  destroying it. It now uses the same test as `--rules`.
+- `--name ""`, `--name " Hydrants"` and `--name D:/gis/u.gdb/Hydrants` used to print `nothing
+  empties or drops` and exit 0, because no dataset can match them. They are now a usage error
+  (exit 64).
+- A `.txt` file that mentions `arcpy` and does not parse, such as a Python 2 script, used to be
+  skipped with exit 0. It is now an error (exit 2). A `.txt` note that never mentions `arcpy` is
+  still skipped, and the header line counts it.
+- `os.path.join()` with no argument printed an empty path. It is now unknown.
 
 ## What it checks
 
-Every call to one of 19 arcpy entry points gets one of four verdicts, per argument:
+Every call to one of the 33 arcpy tools in the `TOOLS` table gets one of four verdicts, per
+argument:
 
 | Verdict | Meaning | Where it comes from |
 |---|---|---|
 | `DROP` | The dataset object is removed | `Delete` |
 | `EMPTY` | Every row is removed, the object stays | `TruncateTable`, `DeleteFeatures`, `DeleteRows` |
-| `WRITE` | Rows or fields are added or changed | `Append` target, `CopyFeatures` output, `InsertCursor`, `UpdateCursor`, `CalculateField`, `AddField`, `DeleteField`, `CopyRows` output |
-| `READ` | Nothing is changed | `SearchCursor`, `GetCount`, `Exists`, `MakeFeatureLayer`, `MakeTableView`, `SelectLayerByAttribute`, `Append` inputs, `CopyFeatures` input, `CopyRows` input, `FeatureClassToFeatureClass` input |
+| `WRITE` | Rows or fields are added or changed | `Append` target, `InsertCursor`, `UpdateCursor`, `CalculateField`, `AddField`, `DeleteField`, and the output of `CopyFeatures`, `CopyRows`, `FeatureClassToFeatureClass`, `TableToTable`, `ExportFeatures`, `Buffer`, `Clip`, `Intersect`, `Merge`, `Project`, `Copy`, `Dissolve`, `Erase`, `Union`, `Identity`, `Update` and `SpatialJoin` |
+| `READ` | Nothing is changed | `SearchCursor`, `GetCount`, `Exists`, `MakeFeatureLayer`, `MakeTableView`, `SelectLayerByAttribute`, and the input of every tool in the `WRITE` row |
+
+A `WRITE` is not an `EMPTY`, but one case counts as one. An `UpdateCursor` in a file that also calls
+`deleteRow` may remove rows, so it is reported next to the `EMPTY` and `DROP` sites. The tool cannot
+tell which rows, or whether the `deleteRow` belongs to that cursor.
 
 `DROP` is separate from `EMPTY` on purpose. `arcpy.Delete_management(fc, "FeatureClass")` removes
 the feature class itself, so every map, service and script that referenced it breaks. A truncate
@@ -408,11 +470,13 @@ assertion in the self-test, because both of them lose a morning.
 | 1 | The report named at least one call site that empties or drops a dataset. |
 | 2 | A file could not be read or parsed, so the answer is incomplete. |
 | 3 | `--rules` only. No destructive call site is proven, and at least one is possible. |
-| 64 | A usage error: no path, a path that does not exist, or `--rules` without `--name`. |
+| 64 | A usage error: no path, a path that does not exist, `--rules` without `--name`, or a `--name` that can match no dataset. |
 
 In `--rules` mode, 1 means a destructive call site is proven and 3 means none is proven but one is
-possible. A possible call site that only writes rows does not change the exit code. Without
-`--rules`, the exit code is as before and 3 is never returned.
+possible. A call site that only writes rows does not change the exit code, whether it is possible or
+proven, so a script that asks who writes a dataset must read the report, not the exit code. Only
+`EMPTY`, `DROP` and a cursor that may delete rows count. Without `--rules`, the exit code is as
+before and 3 is never returned.
 
 Exit 2 wins over exit 1 and 3. A run that could not read every file gives you an answer that may be
 missing the call site you are looking for, and that matters more than what it did find.
@@ -437,9 +501,57 @@ missing the call site you are looking for, and that matters more than what it di
 - `%` formatting and `str.format` are not resolved. `os.path.join` and `+` are.
 - A constant in a class body is not resolved. Module-level constants are, inside every function in
   the file.
-- A tool outside the table of 19 is not classified at all. That is the safe direction, and it means
-  a destructive tool this does not know about is silently absent. Add it to `TOOLS` at the top of
-  the file.
+- A destructive arcpy tool that is not in `TOOLS`, such as `Rename` or `DeleteIdentical`, is not
+  reported at all, and the report carries no caveat. `Rename` removes the dataset name just as a
+  drop does. `CreateFeatureclass` with an overwrite, `CreateTable` and the `Editor` class are
+  absent too. Add the tool to `TOOLS` at the top of the file. Deletes that do not go through arcpy,
+  such as `shutil.rmtree`, are not read.
+- Under `--rules` a proven `WRITE` does not change the exit code. Only `EMPTY`, `DROP` and a cursor
+  that may delete rows do. A `WRITE` that replaces the dataset, such as `CopyFeatures` onto an
+  existing output with `overwriteOutput`, is graded `WRITE`, so an overwrite is invisible to a
+  script that checks only the exit code.
+- A name assigned inside an `if` arm makes the call site `POSSIBLE` for every `--name` you ask
+  about, not only the names the branches could hold. `--rules --name Parcels` exits 3 on a site
+  that resolves to `Roads` for that reason.
+- Every call under `if __name__ == "__main__":` that uses a name assigned in that block is
+  `POSSIBLE`, never `PROVEN`, so a typical main-guard script exits 3 under `--rules` instead of 1.
+- A name rebound by `def`, `class`, `del`, `exec` or `globals()` keeps its first value. An
+  assignment, an import and `global` are modelled.
+- A name that an enclosing function binds is unknown inside a nested function, even when the
+  enclosing function gave it a literal. The call site is `POSSIBLE` with an unresolved target.
+- A list, a semicolon-separated string and an expression such as `os.path.join(*parts)` are not
+  split into datasets. `Delete(path_list)` is listed as unresolved. A string such as
+  `"a.gdb\Hydrants;a.gdb\Roads"` is read as one path whose name is the last piece, so it is
+  matched against `Roads` only. A default parameter value is not used as the value of the
+  parameter.
+- A function that is also passed by reference, as in `map(wipe, items)`, is graded against the one
+  call the tool sees. The real target can differ.
+- A dynamically executed call, such as `exec("arcpy.management.TruncateTable(...)")` or a tool
+  fetched through a name built at run time, is invisible. The run exits 0 without a word.
+- `from os import path as p` followed by `p.join(...)` is not read as `os.path.join`. The result
+  is unresolved, which is `POSSIBLE` under `--rules`.
+- A source literal with surrounding whitespace or embedded quote characters, such as `"Hydrants "`
+  or `'"W.P.Hydrants"'`, does not match `--name Hydrants`.
+- Only arcpy is read. The ArcGIS API for Python (`FeatureLayer.manager.truncate`,
+  `delete_features`), REST calls and SQL scripts are not. Exit 0 means no arcpy call was found,
+  not that nothing empties the layer.
+- A `Delete` of a folder, or of a feature dataset with no `data_type` and no other call site under
+  it, is not recognised as a container. Only a `.gdb`, `.mdb` or `.gpkg` name, `data_type`
+  `FeatureDataset`, and a path another call site in the same file puts a dataset under are.
+- A folder or geodatabase whose name minus its extension equals the query also matches. A
+  `Delete` of `Hydrants.gdb` matches `--name Hydrants`.
+- The `deleteRow` flag belongs to the file. Any `UpdateCursor` in a file with a `deleteRow` call is
+  flagged, whether or not the call is made on that cursor.
+- Source is decoded as UTF-8, with undecodable bytes replaced. A script saved in a legacy code page
+  is read that way, so a non-ASCII dataset name in it will not match `--name`.
+- A file saved as UTF-16 cannot be parsed. The run exits 2 and names the file.
+- A `.txt` note found while walking a directory is read as Python if it happens to parse, and a
+  single word is a valid expression. It counts as a file read, and the run can exit 0 over a
+  folder that holds no script. A `.txt` file that mentions `arcpy` and does not parse is an error.
+- Pass each file once. A file passed twice, or inside a directory that is also passed, is scanned
+  twice and every call site is listed twice.
+- Resolved paths are printed as written in the source. A path literal that holds a user name or a
+  password is echoed in the report, so redact a report before you post it.
 - A selection is not modelled. Per the Esri tool pages, `DeleteFeatures` and `DeleteRows` against a
   layer with a selection remove the selected rows only, and this reports the whole feature class as
   emptied. `TruncateTable` ignores a selection and removes every row, so for that tool the report
@@ -450,7 +562,7 @@ missing the call site you are looking for, and that matters more than what it di
   Windows prints `demo\sync_vendor.py`. The counts and lines are otherwise identical (checked on both).
 - Resolved paths print with a backslash separator whatever host you run on, because arcpy paths are
   Windows paths. Matching itself accepts either separator.
-- `.py`, `.pyt` and `.txt` are read when a directory is walked. A file named directly on the command
+- `.py`, `.pyw`, `.pyt` and `.txt` are read when a directory is walked. A file named directly on the command
   line is read whatever it is called.
 
 ## Related
@@ -464,14 +576,17 @@ Other single-file tools in this portfolio that pair with this one:
 
 ## Sources checked
 
-Read on 2026-10-22. Each behaviour this tool depends on, and the page that states it.
+Read on 2026-10-30. Each behaviour this tool depends on, and the page that states it. The
+parameter names of the other tools in `TOOLS` were not re-read in this release.
 
 | Behaviour | Source |
 |---|---|
 | Truncate Table removes all rows, ignores a selection, and cannot be recovered | [Truncate Table](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/truncatetable.html) |
 | Delete Features removes all features, or only the selected ones when a layer has a selection | [Delete Features](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/delete-features.htm) |
 | Delete Rows removes all rows, or only the selected ones | [Delete Rows](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/delete-rows.htm) |
-| Delete permanently deletes the data object | [Delete](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/delete.htm) |
+| Delete permanently deletes the data object, and deleting a workspace deletes all contained items. The `data_type` keywords include `FeatureDataset`. | [Delete](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/delete.html) |
+| `UpdateCursor.deleteRow()` deletes the current row | [UpdateCursor](https://doc.esri.com/en/arcgis-pro/latest/arcpy/data-access/updatecursor-class.html) |
+| Parameter names and order of `Clip`, `SpatialJoin`, `ExportFeatures`, `Identity`, `Merge`, `Copy`, `Update`, `TableToTable`, `Project` and `CopyRows`, which the `TOOLS` table relies on | [Clip](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/analysis/clip.html), [Spatial Join](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/analysis/spatial-join.html), [Export Features](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/conversion/export-features.html), [Identity](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/analysis/identity.html), [Merge](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/merge.html), [Copy](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/copy.html), [Update](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/analysis/update.html), [Table To Table](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/conversion/table-to-table.html), [Project](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/project.html), [Copy Rows](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/copy-rows.html) |
 | `os.path.join` discards earlier segments when one is absolute | [os.path](https://docs.python.org/3/library/os.path.html) |
 | `argparse` accepts a unique prefix of a long option unless `allow_abbrev=False` | [argparse](https://docs.python.org/3/library/argparse.html) |
 | Editor tracking records who edited a row | [Enable editor tracking](https://pro.arcgis.com/en/pro-app/latest/help/data/geodatabases/overview/enable-editor-tracking.htm) |
